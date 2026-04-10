@@ -8,7 +8,7 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use thiserror::Error;
 use vmm_sys_util::eventfd::EventFd;
 
-use crate::{BatchRequest, DiskTopology};
+use crate::{BatchRequest, DiskTopology, SECTOR_SIZE};
 
 #[derive(Error, Debug)]
 pub enum DiskFileError {
@@ -24,6 +24,8 @@ pub enum DiskFileError {
     /// Resize failed
     #[error("Resize failed")]
     ResizeError(#[source] std::io::Error),
+    #[error("Failed cloning disk file")]
+    Clone(#[source] std::io::Error),
 }
 
 pub type DiskFileResult<T> = std::result::Result<T, DiskFileError>;
@@ -78,6 +80,18 @@ pub trait DiskFile: Send {
         Err(DiskFileError::Unsupported)
     }
 
+    /// Indicates support for sparse operations (punch hole, write zeroes, discard).
+    /// Override to return true when supported.
+    fn supports_sparse_operations(&self) -> bool {
+        false
+    }
+
+    /// Indicates support for zero flag optimization in WRITE_ZEROES. Override
+    /// to return true when supported.
+    fn supports_zero_flag(&self) -> bool {
+        false
+    }
+
     /// Returns the file descriptor of the underlying disk image file.
     ///
     /// The file descriptor is supposed to be used for `fcntl()` calls but no
@@ -96,6 +110,12 @@ pub enum AsyncIoError {
     /// Failed synchronizing file.
     #[error("Failed synchronizing file")]
     Fsync(#[source] std::io::Error),
+    /// Failed punching hole.
+    #[error("Failed punching hole")]
+    PunchHole(#[source] std::io::Error),
+    /// Failed writing zeroes.
+    #[error("Failed writing zeroes")]
+    WriteZeroes(#[source] std::io::Error),
     /// Failed submitting batch requests.
     #[error("Failed submitting batch requests")]
     SubmitBatchRequests(#[source] std::io::Error),
@@ -118,11 +138,16 @@ pub trait AsyncIo: Send {
         user_data: u64,
     ) -> AsyncIoResult<()>;
     fn fsync(&mut self, user_data: Option<u64>) -> AsyncIoResult<()>;
+    fn punch_hole(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()>;
+    fn write_zeroes(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()>;
     fn next_completed_request(&mut self) -> Option<(u64, i32)>;
     fn batch_requests_enabled(&self) -> bool {
         false
     }
     fn submit_batch_requests(&mut self, _batch_request: &[BatchRequest]) -> AsyncIoResult<()> {
         Ok(())
+    }
+    fn alignment(&self) -> u64 {
+        SECTOR_SIZE
     }
 }

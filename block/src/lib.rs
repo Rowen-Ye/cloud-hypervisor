@@ -9,6 +9,8 @@
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
 pub mod async_io;
+pub mod disk_file;
+pub mod error;
 pub mod fcntl;
 pub mod fixed_vhd;
 #[cfg(feature = "io_uring")]
@@ -23,6 +25,8 @@ pub mod qcow_sync;
 /// Enabled with the `"io_uring"` feature
 pub mod raw_async;
 pub mod raw_async_aio;
+#[cfg(test)]
+mod raw_async_io_tests;
 pub mod raw_sync;
 pub mod vhd;
 pub mod vhdx;
@@ -30,19 +34,23 @@ pub mod vhdx_sync;
 
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::collections::VecDeque;
-use std::fmt::Debug;
-use std::fs::File;
+use std::fmt::{self, Debug};
+use std::fs::{File, OpenOptions};
 use std::io::{self, IoSlice, IoSliceMut, Read, Seek, SeekFrom, Write};
 use std::os::linux::fs::MetadataExt;
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
+use std::str::FromStr;
 use std::time::Instant;
-use std::{cmp, result};
+use std::{cmp, mem, result};
 
 #[cfg(feature = "io_uring")]
 use io_uring::{IoUring, Probe, opcode};
-use libc::{S_IFBLK, S_IFMT, ioctl};
-use log::{error, info, warn};
+use libc::{
+    FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE, S_IFBLK, S_IFMT, ioctl,
+};
+use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use thiserror::Error;
@@ -50,17 +58,30 @@ use virtio_bindings::virtio_blk::*;
 use virtio_queue::DescriptorChain;
 use vm_memory::bitmap::Bitmap;
 use vm_memory::{
-    ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryLoadGuard,
+    Address, ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryLoadGuard,
 };
 use vm_virtio::{AccessPlatform, Translatable};
 use vmm_sys_util::eventfd::EventFd;
-use vmm_sys_util::{aio, ioctl_io_nr};
+use vmm_sys_util::{aio, ioctl_io_nr, ioctl_ior_nr};
 
 use crate::async_io::{AsyncIo, AsyncIoError, AsyncIoResult};
+use crate::error::{BlockError, BlockErrorKind, BlockResult, ErrorOp};
 use crate::vhdx::VhdxError;
 
 const SECTOR_SHIFT: u8 = 9;
 pub const SECTOR_SIZE: u64 = 0x01 << SECTOR_SHIFT;
+
+/// Maximum number of segments per DISCARD or WRITE_ZEROES request.
+pub const MAX_DISCARD_WRITE_ZEROES_SEG: u32 = 1;
+
+/// Size and field offsets within `struct virtio_blk_discard_write_zeroes`.
+const DISCARD_WZ_SEG_SIZE: u32 = mem::size_of::<virtio_blk_discard_write_zeroes>() as u32;
+const DISCARD_WZ_MAX_PAYLOAD: u32 = DISCARD_WZ_SEG_SIZE * MAX_DISCARD_WRITE_ZEROES_SEG;
+const DISCARD_WZ_SECTOR_OFFSET: u64 =
+    mem::offset_of!(virtio_blk_discard_write_zeroes, sector) as u64;
+const DISCARD_WZ_NUM_SECTORS_OFFSET: u64 =
+    mem::offset_of!(virtio_blk_discard_write_zeroes, num_sectors) as u64;
+const DISCARD_WZ_FLAGS_OFFSET: u64 = mem::offset_of!(virtio_blk_discard_write_zeroes, flags) as u64;
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -90,6 +111,8 @@ pub enum Error {
     RawFileError(#[source] std::io::Error),
     #[error("The requested operation does not support multiple descriptors")]
     TooManyDescriptors,
+    #[error("Request contains too many segments ({0}, max {MAX_DISCARD_WRITE_ZEROES_SEG})")]
+    TooManySegments(u32),
     #[error("Failure in vhdx")]
     VhdxError(#[source] VhdxError),
 }
@@ -146,6 +169,8 @@ pub enum ExecuteError {
     WriteAll(#[source] io::Error),
     #[error("Unsupported request: {0}")]
     Unsupported(u32),
+    #[error("Unsupported flags {flags:#x} for request type {request_type}")]
+    UnsupportedFlags { request_type: u32, flags: u32 },
     #[error("Failed to submit io uring")]
     SubmitIoUring(#[source] io::Error),
     #[error("Failed to get guest address")]
@@ -156,6 +181,10 @@ pub enum ExecuteError {
     AsyncWrite(#[source] AsyncIoError),
     #[error("failed to async flush")]
     AsyncFlush(#[source] AsyncIoError),
+    #[error("Failed to async punch hole")]
+    AsyncPunchHole(#[source] AsyncIoError),
+    #[error("Failed to async write zeroes")]
+    AsyncWriteZeroes(#[source] AsyncIoError),
     #[error("Failed allocating a temporary buffer")]
     TemporaryBufferAllocation(#[source] io::Error),
 }
@@ -172,11 +201,14 @@ impl ExecuteError {
             ExecuteError::Write(_) => VIRTIO_BLK_S_IOERR,
             ExecuteError::WriteAll(_) => VIRTIO_BLK_S_IOERR,
             ExecuteError::Unsupported(_) => VIRTIO_BLK_S_UNSUPP,
+            ExecuteError::UnsupportedFlags { .. } => VIRTIO_BLK_S_UNSUPP,
             ExecuteError::SubmitIoUring(_) => VIRTIO_BLK_S_IOERR,
             ExecuteError::GetHostAddress(_) => VIRTIO_BLK_S_IOERR,
             ExecuteError::AsyncRead(_) => VIRTIO_BLK_S_IOERR,
             ExecuteError::AsyncWrite(_) => VIRTIO_BLK_S_IOERR,
             ExecuteError::AsyncFlush(_) => VIRTIO_BLK_S_IOERR,
+            ExecuteError::AsyncPunchHole(_) => VIRTIO_BLK_S_IOERR,
+            ExecuteError::AsyncWriteZeroes(_) => VIRTIO_BLK_S_IOERR,
             ExecuteError::TemporaryBufferAllocation(_) => VIRTIO_BLK_S_IOERR,
         };
         status as u8
@@ -189,6 +221,8 @@ pub enum RequestType {
     Out,
     Flush,
     GetDeviceId,
+    Discard,
+    WriteZeroes,
     Unsupported(u32),
 }
 
@@ -202,6 +236,8 @@ pub fn request_type<B: Bitmap + 'static>(
         VIRTIO_BLK_T_OUT => Ok(RequestType::Out),
         VIRTIO_BLK_T_FLUSH => Ok(RequestType::Flush),
         VIRTIO_BLK_T_GET_ID => Ok(RequestType::GetDeviceId),
+        VIRTIO_BLK_T_DISCARD => Ok(RequestType::Discard),
+        VIRTIO_BLK_T_WRITE_ZEROES => Ok(RequestType::WriteZeroes),
         t => Ok(RequestType::Unsupported(t)),
     }
 }
@@ -297,6 +333,12 @@ impl Request {
             req.data_descriptors.reserve_exact(1);
             while desc.has_next() {
                 if desc.is_write_only() && req.request_type == RequestType::Out {
+                    return Err(Error::UnexpectedWriteOnlyDescriptor);
+                }
+                if desc.is_write_only() && req.request_type == RequestType::Discard {
+                    return Err(Error::UnexpectedWriteOnlyDescriptor);
+                }
+                if desc.is_write_only() && req.request_type == RequestType::WriteZeroes {
                     return Err(Error::UnexpectedWriteOnlyDescriptor);
                 }
                 if !desc.is_write_only() && req.request_type == RequestType::In {
@@ -395,6 +437,12 @@ impl Request {
                     mem.write_slice(serial, *data_addr)
                         .map_err(ExecuteError::Write)?;
                 }
+                RequestType::Discard => {
+                    return Err(ExecuteError::Unsupported(VIRTIO_BLK_T_DISCARD));
+                }
+                RequestType::WriteZeroes => {
+                    return Err(ExecuteError::Unsupported(VIRTIO_BLK_T_WRITE_ZEROES));
+                }
                 RequestType::Unsupported(t) => return Err(ExecuteError::Unsupported(t)),
             }
         }
@@ -407,11 +455,13 @@ impl Request {
         disk_nsectors: u64,
         disk_image: &mut dyn AsyncIo,
         serial: &[u8],
+        disable_sector0_writes: bool,
         user_data: u64,
     ) -> result::Result<ExecuteAsync, ExecuteError> {
         let sector = self.sector;
         let request_type = self.request_type;
         let offset = (sector << SECTOR_SHIFT) as libc::off_t;
+        let alignment = disk_image.alignment();
 
         let mut iovecs: SmallVec<[libc::iovec; DEFAULT_DESCRIPTOR_VEC_SIZE]> =
             SmallVec::with_capacity(self.data_descriptors.len());
@@ -442,14 +492,15 @@ impl Request {
             assert!(origin_ptr.len() >= data_len);
             let origin_ptr = origin_ptr.ptr_guard();
 
-            // Verify the buffer alignment.
-            // In case it's not properly aligned, an intermediate buffer is
-            // created with the correct alignment, and a copy from/to the
-            // origin buffer is performed, depending on the type of operation.
-            let iov_base = if (origin_ptr.as_ptr() as u64).is_multiple_of(SECTOR_SIZE) {
+            // O_DIRECT requires buffer addresses to be aligned to the
+            // backend device's logical block size. In case it's not properly
+            // aligned, an intermediate buffer is created with the correct
+            // alignment, and a copy from/to the origin buffer is performed,
+            // depending on the type of operation.
+            let iov_base = if (origin_ptr.as_ptr() as u64).is_multiple_of(alignment) {
                 origin_ptr.as_ptr() as *mut libc::c_void
             } else {
-                let layout = Layout::from_size_align(data_len, SECTOR_SIZE as usize).unwrap();
+                let layout = Layout::from_size_align(data_len, alignment as usize).unwrap();
                 // SAFETY: layout has non-zero size
                 let aligned_ptr = unsafe { alloc_zeroed(layout) };
                 if aligned_ptr.is_null() {
@@ -543,6 +594,143 @@ impl Request {
                     .map_err(ExecuteError::Write)?;
                 ret.async_complete = false;
                 return Ok(ret);
+            }
+            RequestType::Discard => {
+                let (data_addr, data_len) = if self.data_descriptors.len() == 1 {
+                    (self.data_descriptors[0].0, self.data_descriptors[0].1)
+                } else {
+                    return Err(ExecuteError::BadRequest(Error::TooManyDescriptors));
+                };
+
+                if data_len < DISCARD_WZ_SEG_SIZE {
+                    return Err(ExecuteError::BadRequest(Error::DescriptorLengthTooSmall));
+                }
+                if data_len > DISCARD_WZ_MAX_PAYLOAD {
+                    return Err(ExecuteError::BadRequest(Error::TooManySegments(
+                        data_len.div_ceil(DISCARD_WZ_SEG_SIZE),
+                    )));
+                }
+
+                let mut discard_sector = [0u8; 8];
+                let mut discard_num_sectors = [0u8; 4];
+                let mut discard_flags = [0u8; 4];
+
+                let sector_addr = data_addr.checked_add(DISCARD_WZ_SECTOR_OFFSET).unwrap();
+                mem.read_slice(&mut discard_sector, sector_addr)
+                    .map_err(ExecuteError::Read)?;
+
+                let num_sectors_addr = data_addr
+                    .checked_add(DISCARD_WZ_NUM_SECTORS_OFFSET)
+                    .unwrap();
+                mem.read_slice(&mut discard_num_sectors, num_sectors_addr)
+                    .map_err(ExecuteError::Read)?;
+
+                let flags_addr = data_addr.checked_add(DISCARD_WZ_FLAGS_OFFSET).unwrap();
+                mem.read_slice(&mut discard_flags, flags_addr)
+                    .map_err(ExecuteError::Read)?;
+
+                let discard_flags = u32::from_le_bytes(discard_flags);
+                // Per virtio spec v1.2 reject discard if any flag is set, including unmap.
+                if discard_flags != 0 {
+                    warn!("Unsupported flags {discard_flags:#x} in discard request");
+                    return Err(ExecuteError::UnsupportedFlags {
+                        request_type: VIRTIO_BLK_T_DISCARD,
+                        flags: discard_flags,
+                    });
+                }
+
+                let discard_sector = u64::from_le_bytes(discard_sector);
+
+                if discard_sector == 0 && disable_sector0_writes {
+                    return Err(ExecuteError::BadRequest(Error::InvalidOffset));
+                }
+
+                let discard_num_sectors = u32::from_le_bytes(discard_num_sectors);
+
+                let top = discard_sector
+                    .checked_add(discard_num_sectors as u64)
+                    .ok_or(ExecuteError::BadRequest(Error::InvalidOffset))?;
+                if top > disk_nsectors {
+                    return Err(ExecuteError::BadRequest(Error::InvalidOffset));
+                }
+
+                let discard_offset = discard_sector * SECTOR_SIZE;
+                let discard_length = (discard_num_sectors as u64) * SECTOR_SIZE;
+
+                disk_image
+                    .punch_hole(discard_offset, discard_length, user_data)
+                    .map_err(ExecuteError::AsyncPunchHole)?;
+            }
+            RequestType::WriteZeroes => {
+                let (data_addr, data_len) = if self.data_descriptors.len() == 1 {
+                    (self.data_descriptors[0].0, self.data_descriptors[0].1)
+                } else {
+                    return Err(ExecuteError::BadRequest(Error::TooManyDescriptors));
+                };
+
+                if data_len < DISCARD_WZ_SEG_SIZE {
+                    return Err(ExecuteError::BadRequest(Error::DescriptorLengthTooSmall));
+                }
+                if data_len > DISCARD_WZ_MAX_PAYLOAD {
+                    return Err(ExecuteError::BadRequest(Error::TooManySegments(
+                        data_len.div_ceil(DISCARD_WZ_SEG_SIZE),
+                    )));
+                }
+
+                let mut wz_sector = [0u8; 8];
+                let mut wz_num_sectors = [0u8; 4];
+                let mut wz_flags = [0u8; 4];
+
+                let sector_addr = data_addr.checked_add(DISCARD_WZ_SECTOR_OFFSET).unwrap();
+                mem.read_slice(&mut wz_sector, sector_addr)
+                    .map_err(ExecuteError::Read)?;
+
+                let num_sectors_addr = data_addr
+                    .checked_add(DISCARD_WZ_NUM_SECTORS_OFFSET)
+                    .unwrap();
+                mem.read_slice(&mut wz_num_sectors, num_sectors_addr)
+                    .map_err(ExecuteError::Read)?;
+
+                let flags_addr = data_addr.checked_add(DISCARD_WZ_FLAGS_OFFSET).unwrap();
+                mem.read_slice(&mut wz_flags, flags_addr)
+                    .map_err(ExecuteError::Read)?;
+
+                let wz_sector = u64::from_le_bytes(wz_sector);
+                let wz_num_sectors = u32::from_le_bytes(wz_num_sectors);
+
+                let wz_flags = u32::from_le_bytes(wz_flags);
+                // Per virtio spec v1.2 reject write zeroes if any unknown flag is set.
+                if (wz_flags & !VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP) != 0 {
+                    warn!("Unsupported flags {wz_flags:#x} in write zeroes request");
+                    return Err(ExecuteError::UnsupportedFlags {
+                        request_type: VIRTIO_BLK_T_WRITE_ZEROES,
+                        flags: wz_flags,
+                    });
+                }
+
+                let wz_offset = wz_sector * SECTOR_SIZE;
+                if wz_offset == 0 && disable_sector0_writes {
+                    return Err(ExecuteError::BadRequest(Error::InvalidOffset));
+                }
+
+                let top = wz_sector
+                    .checked_add(wz_num_sectors as u64)
+                    .ok_or(ExecuteError::BadRequest(Error::InvalidOffset))?;
+                if top > disk_nsectors {
+                    return Err(ExecuteError::BadRequest(Error::InvalidOffset));
+                }
+
+                let wz_length = (wz_num_sectors as u64) * SECTOR_SIZE;
+
+                if wz_flags & VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP != 0 {
+                    disk_image
+                        .punch_hole(wz_offset, wz_length, user_data)
+                        .map_err(ExecuteError::AsyncPunchHole)?;
+                } else {
+                    disk_image
+                        .write_zeroes(wz_offset, wz_length, user_data)
+                        .map_err(ExecuteError::AsyncWriteZeroes)?;
+                }
             }
             RequestType::Unsupported(t) => return Err(ExecuteError::Unsupported(t)),
         }
@@ -684,6 +872,126 @@ pub fn block_io_uring_is_supported() -> bool {
     }
 }
 
+/// Probe whether the file/device supports punch hole and zero range
+pub fn probe_sparse_support(file: &File) -> bool {
+    let fd = file.as_raw_fd();
+
+    let is_block_device = {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: FFI call with valid fd and buffer
+        let ret = unsafe { libc::fstat(fd, stat.as_mut_ptr()) };
+        if ret != 0 {
+            warn!(
+                "Failed to stat file descriptor for sparse probe: {}",
+                io::Error::last_os_error()
+            );
+            return false;
+        }
+        // SAFETY: stat result is valid at this point
+        unsafe { (*stat.as_ptr()).st_mode & S_IFMT == S_IFBLK }
+    };
+
+    if is_block_device {
+        probe_block_device_sparse_support(fd)
+    } else {
+        probe_file_sparse_support(fd)
+    }
+}
+
+/// Probe sparse support for a regular file using fallocate().
+fn probe_file_sparse_support(fd: libc::c_int) -> bool {
+    // SAFETY: FFI call with valid fd
+    let file_size = unsafe { libc::lseek(fd, 0, libc::SEEK_END) };
+    if file_size < 0 {
+        let err = io::Error::last_os_error();
+        warn!("Failed to get file size for sparse probe: {err}");
+        return false;
+    }
+
+    // SAFETY: FFI call with valid fd, probing past EOF is safe with KEEP_SIZE
+    let punch_hole =
+        unsafe { libc::fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, file_size, 1) }
+            == 0;
+
+    if !punch_hole {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EOPNOTSUPP) {
+            debug!("File does not support FALLOC_FL_PUNCH_HOLE: {err}");
+        } else {
+            debug!("PUNCH_HOLE probe returned unexpected error: {err}");
+        }
+    }
+
+    // SAFETY: FFI call with valid fd, probing past EOF is safe with KEEP_SIZE
+    let zero_range =
+        unsafe { libc::fallocate(fd, FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE, file_size, 1) }
+            == 0;
+
+    if !zero_range {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EOPNOTSUPP) {
+            debug!("File does not support FALLOC_FL_ZERO_RANGE: {err}");
+        }
+    }
+
+    let supported = punch_hole || zero_range;
+    info!(
+        "Probed file sparse support: punch_hole={punch_hole}, zero_range={zero_range} => {supported}"
+    );
+    supported
+}
+
+/// Probe sparse support for a block device.
+///
+/// Block devices always report sparse support. `BLKZEROOUT` is guaranteed to
+/// succeed as the kernel provides a software fallback writing explicit zeros
+/// when the hardware lacks a native write zeroes command. `BLKDISCARD` may fail
+/// at runtime with `EOPNOTSUPP` on devices without trim or discard support, but
+/// Linux guests handle this gracefully by ceasing discard requests.
+///
+/// There is no non destructive read only ioctl to query block device discard
+/// or write zeroes capabilities.
+fn probe_block_device_sparse_support(_fd: libc::c_int) -> bool {
+    info!("Block device: assuming sparse support");
+    true
+}
+
+/// Preallocate disk space for a disk image file.
+///
+/// Uses `fallocate()` to allocate all disk space upfront, ensuring storage
+/// availability and reducing fragmentation. Allocating all blocks upfront is
+/// more likely to place them contiguously than allocating on demand during
+/// random writes.
+pub fn preallocate_disk<P: AsRef<Path>>(file: &File, path: P) {
+    let size = match file.metadata() {
+        Ok(m) => m.len(),
+        Err(e) => {
+            warn!("Failed to get metadata for {:?}: {}", path.as_ref(), e);
+            return;
+        }
+    };
+
+    if size == 0 {
+        return;
+    }
+
+    // SAFETY: FFI call with valid file descriptor and size
+    let ret = unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, size as libc::off_t) };
+
+    if ret != 0 {
+        warn!(
+            "Failed to preallocate disk space for {:?}: {}",
+            path.as_ref(),
+            io::Error::last_os_error()
+        );
+    } else {
+        debug!(
+            "Preallocated {size} bytes for disk image {:?}",
+            path.as_ref()
+        );
+    }
+}
+
 pub trait AsyncAdaptor {
     fn read_vectored_sync(
         &mut self,
@@ -788,11 +1096,44 @@ pub trait AsyncAdaptor {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ImageType {
     FixedVhd,
     Qcow2,
     Raw,
     Vhdx,
+    #[default]
+    Unknown,
+}
+
+impl fmt::Display for ImageType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ImageType::FixedVhd => write!(f, "vhd"),
+            ImageType::Qcow2 => write!(f, "qcow2"),
+            ImageType::Raw => write!(f, "raw"),
+            ImageType::Vhdx => write!(f, "vhdx"),
+            ImageType::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
+pub enum ImageTypeParseError {
+    InvalidValue(String),
+}
+
+impl FromStr for ImageType {
+    type Err = ImageTypeParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "vhd" => Ok(ImageType::FixedVhd),
+            "qcow2" => Ok(ImageType::Qcow2),
+            "raw" => Ok(ImageType::Raw),
+            "vhdx" => Ok(ImageType::Vhdx),
+            _ => Err(ImageTypeParseError::InvalidValue(s.to_string())),
+        }
+    }
 }
 
 const QCOW_MAGIC: u32 = 0x5146_49fb;
@@ -815,14 +1156,27 @@ pub fn read_aligned_block_size(f: &mut File) -> std::io::Result<Vec<u8>> {
     Ok(data)
 }
 
+/// Open a disk image file, returning a [`BlockError`] with path context
+/// on failure.
+pub fn open_disk_image(path: &Path, options: &OpenOptions) -> BlockResult<File> {
+    options.open(path).map_err(|e| {
+        BlockError::new(BlockErrorKind::Io, e)
+            .with_op(ErrorOp::Open)
+            .with_path(path)
+    })
+}
+
 /// Determine image type through file parsing.
-pub fn detect_image_type(f: &mut File) -> std::io::Result<ImageType> {
-    let block = read_aligned_block_size(f)?;
+pub fn detect_image_type(f: &mut File) -> BlockResult<ImageType> {
+    let block = read_aligned_block_size(f)
+        .map_err(|e| BlockError::new(BlockErrorKind::Io, e).with_op(ErrorOp::DetectImageType))?;
 
     // Check 4 first bytes to get the header value and determine the image type
     let image_type = if u32::from_be_bytes(block[0..4].try_into().unwrap()) == QCOW_MAGIC {
         ImageType::Qcow2
-    } else if vhd::is_fixed_vhd(f)? {
+    } else if vhd::is_fixed_vhd(f)
+        .map_err(|e| BlockError::new(BlockErrorKind::Io, e).with_op(ErrorOp::DetectImageType))?
+    {
         ImageType::FixedVhd
     } else if u64::from_le_bytes(block[0..8].try_into().unwrap()) == VHDX_SIGN {
         ImageType::Vhdx
@@ -867,6 +1221,36 @@ ioctl_io_nr!(BLKSSZGET, 0x12, 104);
 ioctl_io_nr!(BLKPBSZGET, 0x12, 123);
 ioctl_io_nr!(BLKIOMIN, 0x12, 120);
 ioctl_io_nr!(BLKIOOPT, 0x12, 121);
+ioctl_ior_nr!(BLKGETSIZE64, 0x12, 114, u64);
+
+/// Returns `(logical_size, physical_size)` in bytes for regular files and block devices.
+///
+/// For regular files, logical size is `st_size` and physical size is
+/// `st_blocks * 512` (actual host allocation). For block devices both
+/// values equal the `BLKGETSIZE64` result.
+pub fn query_device_size(file: &File) -> io::Result<(u64, u64)> {
+    let m = file.metadata()?;
+    if m.is_file() {
+        // st_blocks is always in 512-byte units on Linux
+        Ok((m.len(), m.st_blocks() * 512))
+    } else if m.file_type().is_block_device() {
+        let mut size: u64 = 0;
+        // SAFETY: BLKGETSIZE64 reads the device size into a u64 pointer.
+        let ret = unsafe { libc::ioctl(file.as_raw_fd(), BLKGETSIZE64() as _, &mut size) };
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((size, size))
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "disk image must be a regular file or block device, is: {:?}",
+                m.file_type()
+            ),
+        ))
+    }
+}
 
 #[derive(Copy, Clone)]
 enum BlockSize {
@@ -913,8 +1297,73 @@ impl DiskTopology {
         Ok(block_size)
     }
 
+    /// Query the O_DIRECT alignment requirement for a regular file.
+    ///
+    /// Uses `statx(STATX_DIOALIGN)` (Linux >= 6.1) to obtain the exact
+    /// memory and offset alignment the kernel requires for direct I/O on
+    /// this specific file. Unlike `fstatvfs().f_bsize`, which only returns
+    /// the filesystem's preferred I/O block size, `STATX_DIOALIGN` reports
+    /// the true per-file DIO constraints accounting for the filesystem,
+    /// underlying block device, and any stacking (loop, dm, etc.).
+    fn query_file_alignment(f: &File) -> u64 {
+        // The libc crate does not expose statx / STATX_DIOALIGN on all
+        // targets (e.g. musl), so define the constant and a minimal repr(C)
+        // struct locally and invoke the syscall directly.
+        const STATX_DIOALIGN: u32 = 0x2000;
+
+        // Minimal statx layout, only the needed fields,
+        // everything else is padding.
+        #[repr(C)]
+        struct Statx {
+            stx_mask: u32,
+            _pad: [u8; 148],
+            stx_dio_mem_align: u32,
+            stx_dio_offset_align: u32,
+            _pad2: [u8; 96],
+        }
+
+        let mut stx = mem::MaybeUninit::<Statx>::zeroed();
+        // SAFETY: FFI syscall with valid fd and correctly sized buffer.
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_statx,
+                f.as_raw_fd(),
+                c"".as_ptr(),
+                libc::AT_EMPTY_PATH,
+                STATX_DIOALIGN,
+                stx.as_mut_ptr(),
+            )
+        };
+        if ret == 0 {
+            // SAFETY: statx succeeded, the struct is fully initialized.
+            let stx = unsafe { stx.assume_init() };
+            if stx.stx_mask & STATX_DIOALIGN != 0 && stx.stx_dio_mem_align > 0 {
+                let align = cmp::max(stx.stx_dio_mem_align, stx.stx_dio_offset_align) as u64;
+                debug!("statx(STATX_DIOALIGN) returned alignment {align}");
+                return align;
+            }
+        }
+
+        debug!("O_DIRECT alignment query failed, falling back to default {SECTOR_SIZE}");
+        SECTOR_SIZE
+    }
+
     pub fn probe(f: &File) -> std::io::Result<Self> {
         if !Self::is_block_device(f)? {
+            // For regular files opened with O_DIRECT, the logical block size
+            // must reflect the filesystem DIO alignment so the guest issues
+            // correctly sized I/O.
+            // SAFETY: fcntl(F_GETFL) is always safe on a valid fd.
+            let flags = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETFL) };
+            if flags >= 0 && (flags & libc::O_DIRECT) != 0 {
+                let alignment = Self::query_file_alignment(f);
+                return Ok(DiskTopology {
+                    logical_block_size: alignment,
+                    physical_block_size: alignment,
+                    minimum_io_size: alignment,
+                    optimal_io_size: 0,
+                });
+            }
             return Ok(DiskTopology::default());
         }
 
@@ -924,5 +1373,195 @@ impl DiskTopology {
             minimum_io_size: Self::query_block_size(f, BlockSize::MinimumIo)?,
             optimal_io_size: Self::query_block_size(f, BlockSize::OptimalIo)?,
         })
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use std::alloc::{Layout, alloc_zeroed, dealloc};
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::{ptr, slice};
+
+    use vmm_sys_util::tempfile::TempFile;
+
+    use super::*;
+
+    #[test]
+    fn test_probe_regular_file_returns_valid_alignment() {
+        let temp_file = TempFile::new().unwrap();
+        let mut f = temp_file.into_file();
+        f.write_all(&[0u8; 4096]).unwrap();
+        f.sync_all().unwrap();
+
+        let topo = DiskTopology::probe(&f).unwrap();
+
+        assert_eq!(
+            topo.logical_block_size, SECTOR_SIZE,
+            "probe() should return {SECTOR_SIZE} for regular files without O_DIRECT, got {}",
+            topo.logical_block_size
+        );
+    }
+
+    #[test]
+    fn test_probe_regular_file_with_direct_returns_dio_alignment() {
+        let temp_file = TempFile::new().unwrap();
+        let path = temp_file.as_path().to_owned();
+        {
+            let f = temp_file.as_file();
+            f.set_len(1 << 20).unwrap(); // 1 MiB
+            f.sync_all().unwrap();
+        }
+
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(&path)
+            .unwrap();
+        let topo = DiskTopology::probe(&f).unwrap();
+
+        assert!(
+            topo.logical_block_size.is_power_of_two(),
+            "logical_block_size {} is not a power of two",
+            topo.logical_block_size
+        );
+        assert!(
+            topo.logical_block_size >= SECTOR_SIZE,
+            "logical_block_size {} is less than SECTOR_SIZE ({SECTOR_SIZE})",
+            topo.logical_block_size
+        );
+
+        let alignment = topo.logical_block_size as usize;
+        let layout = Layout::from_size_align(4096, alignment);
+        assert!(
+            layout.is_ok(),
+            "Layout::from_size_align(4096, {alignment}) failed: {:?}",
+            layout.err()
+        );
+    }
+
+    #[test]
+    fn test_dio_write_read_with_probed_alignment() {
+        let temp_file = TempFile::new().unwrap();
+        let path = temp_file.as_path().to_owned();
+        {
+            let f = temp_file.as_file();
+            f.set_len(1 << 20).unwrap(); // 1 MiB
+            f.sync_all().unwrap();
+        }
+
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(&path)
+            .unwrap();
+        let topo = DiskTopology::probe(&f).unwrap();
+        let alignment = topo.logical_block_size as usize;
+
+        let layout = Layout::from_size_align(alignment, alignment).unwrap();
+        // SAFETY: layout is valid (non-zero, power-of-two alignment).
+        let buf = unsafe { alloc_zeroed(layout) };
+        assert!(!buf.is_null());
+
+        // SAFETY: buf is valid for `alignment` bytes.
+        unsafe { ptr::write_bytes(buf, 0xAB, alignment) };
+
+        // SAFETY: buf is aligned and sized for O_DIRECT; fd is valid.
+        let written =
+            unsafe { libc::pwrite(f.as_raw_fd(), buf as *const libc::c_void, alignment, 0) };
+        assert_eq!(
+            written as usize,
+            alignment,
+            "O_DIRECT pwrite failed: {}",
+            io::Error::last_os_error()
+        );
+
+        // SAFETY: buf is valid for `alignment` bytes.
+        unsafe { ptr::write_bytes(buf, 0x00, alignment) };
+        // SAFETY: buf is aligned and sized for O_DIRECT; fd is valid.
+        let read = unsafe { libc::pread(f.as_raw_fd(), buf as *mut libc::c_void, alignment, 0) };
+        assert_eq!(
+            read as usize,
+            alignment,
+            "O_DIRECT pread failed: {}",
+            io::Error::last_os_error()
+        );
+
+        // SAFETY: buf is valid for `alignment` bytes after successful pread.
+        let slice = unsafe { slice::from_raw_parts(buf, alignment) };
+        assert!(
+            slice.iter().all(|&b| b == 0xAB),
+            "Data mismatch after O_DIRECT roundtrip"
+        );
+
+        // SAFETY: buf was allocated with this layout via alloc_zeroed.
+        unsafe { dealloc(buf, layout) };
+    }
+
+    #[test]
+    fn test_query_device_size_regular_file() {
+        let temp_file = TempFile::new().unwrap();
+        let mut f = temp_file.into_file();
+        // 5 sectors + 13 extra bytes - not page aligned, not sectoraligned
+        f.write_all(&[0xAB; 5 * 512 + 13]).unwrap();
+        f.sync_all().unwrap();
+
+        let (logical, physical) = query_device_size(&f).unwrap();
+        assert_eq!(logical, 5 * 512 + 13);
+        assert!(physical > 0);
+    }
+
+    #[test]
+    fn test_query_device_size_sparse_file_punch_hole() {
+        let temp_file = TempFile::new().unwrap();
+        let f = temp_file.as_file();
+        // Allocate 1 MiB
+        let size: i64 = 1 << 20;
+        f.set_len(size as u64).unwrap();
+        // SAFETY: fd is valid, range is within file size.
+        let ret = unsafe {
+            libc::fallocate(
+                f.as_raw_fd(),
+                0, // allocate
+                0,
+                size,
+            )
+        };
+        assert_eq!(ret, 0, "fallocate failed: {}", io::Error::last_os_error());
+        f.sync_all().unwrap();
+
+        let (log_before, phys_before) = query_device_size(f).unwrap();
+        assert_eq!(log_before, size as u64);
+        assert_eq!(phys_before, size as u64);
+
+        // Punch a hole in the middle 512 KiB
+        // SAFETY: fd is valid, range is within file size.
+        let ret = unsafe {
+            libc::fallocate(
+                f.as_raw_fd(),
+                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                size / 4,
+                size / 2,
+            )
+        };
+        assert_eq!(ret, 0, "punch hole failed: {}", io::Error::last_os_error());
+        f.sync_all().unwrap();
+
+        let (logical, physical) = query_device_size(f).unwrap();
+        assert_eq!(logical, size as u64, "logical size must not change");
+        assert!(
+            physical < logical,
+            "physical ({physical}) should be less than logical ({logical}) after punch hole"
+        );
+    }
+
+    #[test]
+    fn test_query_device_size_rejects_char_device() {
+        let f = std::fs::File::open("/dev/zero").unwrap();
+        let err = query_device_size(&f).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 }

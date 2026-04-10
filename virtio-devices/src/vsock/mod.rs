@@ -158,7 +158,12 @@ pub trait VsockChannel {
 /// It that needs to be sendable through a mpsc channel (the latter due to how `vmm::EpollContext` works).
 /// Currently, the only implementation we have is `crate::virtio::unix::muxer::VsockMuxer`, which
 /// translates guest-side vsock connections to host-side Unix domain socket connections.
-pub trait VsockBackend: VsockChannel + VsockEpollListener + Send {}
+pub trait VsockBackend: VsockChannel + VsockEpollListener + Send {
+    fn connections(&self) -> Vec<(u32, u32)> {
+        Vec::new()
+    }
+    fn queue_rst_for_connections(&mut self, _conns: Vec<(u32, u32)>) {}
+}
 
 #[cfg(any(test, fuzzing))]
 pub mod unit_tests {
@@ -187,6 +192,15 @@ pub mod unit_tests {
             _int_type: VirtioInterruptType,
         ) -> std::result::Result<(), std::io::Error> {
             Ok(())
+        }
+
+        fn set_notifier(
+            &self,
+            _interrupt: u32,
+            _eventfd: Option<EventFd>,
+            _vm: &dyn hypervisor::Vm,
+        ) -> std::io::Result<()> {
+            unimplemented!()
         }
     }
 

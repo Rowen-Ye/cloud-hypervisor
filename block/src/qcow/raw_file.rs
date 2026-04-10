@@ -11,6 +11,7 @@
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::fs::{File, Metadata};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::slice;
 
@@ -19,7 +20,7 @@ use vmm_sys_util::file_traits::FileSync;
 use vmm_sys_util::seek_hole::SeekHole;
 use vmm_sys_util::write_zeroes::{PunchHole, WriteZeroesAt};
 
-use crate::BlockBackend;
+use crate::{BlockBackend, query_device_size};
 
 #[derive(Debug)]
 pub struct RawFile {
@@ -373,11 +374,15 @@ impl SeekHole for RawFile {
 
 impl BlockBackend for RawFile {
     fn logical_size(&self) -> std::result::Result<u64, crate::Error> {
-        Ok(self.metadata().map_err(crate::Error::RawFileError)?.len())
+        Ok(query_device_size(&self.file)
+            .map_err(crate::Error::RawFileError)?
+            .0)
     }
 
     fn physical_size(&self) -> std::result::Result<u64, crate::Error> {
-        Ok(self.metadata().map_err(crate::Error::RawFileError)?.len())
+        Ok(query_device_size(&self.file)
+            .map_err(crate::Error::RawFileError)?
+            .1)
     }
 }
 
@@ -395,5 +400,11 @@ impl Clone for RawFile {
 impl AsRawFd for RawFile {
     fn as_raw_fd(&self) -> RawFd {
         self.file.as_raw_fd()
+    }
+}
+
+impl AsFd for RawFile {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.file.as_fd()
     }
 }

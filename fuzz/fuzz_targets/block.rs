@@ -15,7 +15,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::{ffi, io};
 
-use block::async_io::DiskFile;
+use block::disk_file::DiskBackend;
+use block::fcntl::LockGranularityChoice;
 use block::raw_sync::RawFileDiskSync;
 use libfuzzer_sys::{fuzz_target, Corpus};
 use seccompiler::SeccompAction;
@@ -51,11 +52,10 @@ fuzz_target!(|bytes: &[u8]| -> Corpus {
     // Create a virtio-block device backed by a synchronous raw file
     let shm = memfd_create(&ffi::CString::new("fuzz").unwrap(), 0).unwrap();
     let disk_file: File = unsafe { File::from_raw_fd(shm) };
-    let qcow_disk = Box::new(RawFileDiskSync::new(disk_file)) as Box<dyn DiskFile>;
     let queue_affinity = BTreeMap::new();
     let mut block = Block::new(
         "tmp".to_owned(),
-        qcow_disk,
+        DiskBackend::Next(Box::new(RawFileDiskSync::new(disk_file))),
         PathBuf::from(""),
         false,
         false,
@@ -67,6 +67,9 @@ fuzz_target!(|bytes: &[u8]| -> Corpus {
         EventFd::new(EFD_NONBLOCK).unwrap(),
         None,
         queue_affinity,
+        true,
+        false,
+        LockGranularityChoice::default(),
     )
     .unwrap();
 
@@ -87,11 +90,12 @@ fuzz_target!(|bytes: &[u8]| -> Corpus {
     queue_evt.write(1).unwrap();
 
     block
-        .activate(
-            guest_memory,
-            Arc::new(NoopVirtioInterrupt {}),
-            vec![(0, q, evt)],
-        )
+        .activate(virtio_devices::ActivationContext {
+            mem: guest_memory,
+            interrupt_cb: Arc::new(NoopVirtioInterrupt {}),
+            queues: vec![(0, q, evt)],
+            device_status: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        })
         .ok();
 
     // Wait for the events to finish and block device worker thread to return
@@ -115,6 +119,15 @@ pub struct NoopVirtioInterrupt {}
 impl VirtioInterrupt for NoopVirtioInterrupt {
     fn trigger(&self, _int_type: VirtioInterruptType) -> std::result::Result<(), std::io::Error> {
         Ok(())
+    }
+
+    fn set_notifier(
+        &self,
+        _interrupt: u32,
+        _eventfd: Option<EventFd>,
+        _vm: &dyn hypervisor::Vm,
+    ) -> std::io::Result<()> {
+        unimplemented!()
     }
 }
 

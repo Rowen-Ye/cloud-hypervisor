@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::num::Wrapping;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
@@ -37,6 +37,12 @@ pub trait VirtioInterrupt: Send + Sync {
     fn notifier(&self, _int_type: VirtioInterruptType) -> Option<EventFd> {
         None
     }
+    fn set_notifier(
+        &self,
+        int_type: u32,
+        notifier: Option<EventFd>,
+        vm: &dyn hypervisor::Vm,
+    ) -> std::io::Result<()>;
 }
 
 #[derive(Clone)]
@@ -53,6 +59,13 @@ pub struct VirtioSharedMemoryList {
     pub region_list: Vec<VirtioSharedMemory>,
 }
 
+pub struct ActivationContext {
+    pub mem: GuestMemoryAtomic<GuestMemoryMmap>,
+    pub interrupt_cb: Arc<dyn VirtioInterrupt>,
+    pub queues: Vec<(usize, Queue, EventFd)>,
+    pub device_status: Arc<AtomicU8>,
+}
+
 /// Trait for virtio devices to be driven by a virtio transport.
 ///
 /// The lifecycle of a virtio device is to be moved to a virtio transport, which will then query the
@@ -66,6 +79,18 @@ pub trait VirtioDevice: Send {
 
     /// The maximum size of each queue that this device supports.
     fn queue_max_sizes(&self) -> &[u16];
+
+    /// Whether the device needs to register extra irqfds at runtime
+    /// from external sources.
+    /// The default is false.  If this is true, locking is required for
+    /// most operations involving interrupts (but not for sending)
+    /// interrupts from external irqfds).
+    ///
+    /// If the device claims to not need to register irqfds, but
+    /// attempts to do so, a panic will ensue.
+    fn interrupt_source_mutable(&self) -> bool {
+        false
+    }
 
     /// The set of feature bits that this device supports.
     fn features(&self) -> u64 {
@@ -94,12 +119,7 @@ pub trait VirtioDevice: Send {
     }
 
     /// Activates this device for real usage.
-    fn activate(
-        &mut self,
-        mem: GuestMemoryAtomic<GuestMemoryMmap>,
-        interrupt_evt: Arc<dyn VirtioInterrupt>,
-        queues: Vec<(usize, Queue, EventFd)>,
-    ) -> ActivateResult;
+    fn activate(&mut self, context: ActivationContext) -> ActivateResult;
 
     /// Optionally deactivates this device and returns ownership of the guest memory map, interrupt
     /// event, and queue events.

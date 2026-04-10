@@ -345,7 +345,23 @@ impl VsockEpollListener for VsockMuxer {
     }
 }
 
-impl VsockBackend for VsockMuxer {}
+impl VsockBackend for VsockMuxer {
+    fn connections(&self) -> Vec<(u32, u32)> {
+        self.conn_map
+            .keys()
+            .map(|k| (k.local_port, k.peer_port))
+            .collect()
+    }
+
+    fn queue_rst_for_connections(&mut self, conns: Vec<(u32, u32)>) {
+        for (local_port, peer_port) in conns {
+            self.rxq.push(MuxerRx::RstPkt {
+                local_port,
+                peer_port,
+            });
+        }
+    }
+}
 
 impl VsockMuxer {
     /// Muxer constructor.
@@ -409,7 +425,7 @@ impl VsockMuxer {
                     // If we're already maxed-out on connections, we'll just accept and
                     // immediately discard this potentially new one.
                     warn!("vsock: connection limit reached; refusing new host connection");
-                    self.host_sock.accept().map(|_| 0).unwrap_or(0);
+                    let _ = self.host_sock.accept();
                     return;
                 }
                 self.host_sock

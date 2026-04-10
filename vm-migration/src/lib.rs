@@ -4,13 +4,47 @@
 //
 
 use anyhow::anyhow;
+pub use context::MemoryMigrationContext;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::protocol::MemoryRangeTable;
 
 mod bitpos_iterator;
+mod context;
 pub mod protocol;
+
+#[derive(Error, Debug)]
+pub enum UffdError {
+    #[error("Snapshot ranges are not page-aligned")]
+    UnalignedRanges,
+
+    #[error("Failed to create userfaultfd")]
+    Create(#[source] std::io::Error),
+
+    #[error("Cannot translate GPA {gpa:#x} to host address")]
+    GpaTranslation { gpa: u64 },
+
+    #[error("Failed to register region at {addr:#x}+{len:#x}")]
+    Register {
+        addr: u64,
+        len: u64,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("Region at {addr:#x}+{len:#x} missing COPY/WAKE support")]
+    MissingIoctlSupport { addr: u64, len: u64 },
+
+    #[error("Failed to spawn handler thread")]
+    SpawnThread(#[source] std::io::Error),
+
+    #[error("Handler terminated before startup completed")]
+    HandlerStartup,
+
+    #[error("Handler failed after startup")]
+    HandlerFailed(#[source] std::io::Error),
+}
 
 #[derive(Error, Debug)]
 pub enum MigratableError {
@@ -31,6 +65,9 @@ pub enum MigratableError {
 
     #[error("Failed to receive migratable component snapshot")]
     MigrateReceive(#[source] anyhow::Error),
+
+    #[error("On-demand restore failed")]
+    OnDemandRestore(#[source] UffdError),
 
     #[error("Socket error")]
     MigrateSocket(#[source] std::io::Error),

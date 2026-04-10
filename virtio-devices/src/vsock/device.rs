@@ -50,7 +50,7 @@ use crate::seccomp_filters::Thread;
 use crate::thread_helper::spawn_virtio_thread;
 use crate::{
     ActivateResult, EPOLL_HELPER_EVENT_LAST, EpollHelper, EpollHelperError, EpollHelperHandler,
-    Error as DeviceError, GuestMemoryMmap, VIRTIO_F_IN_ORDER, VIRTIO_F_IOMMU_PLATFORM,
+    Error as DeviceError, GuestMemoryMmap, VIRTIO_F_ACCESS_PLATFORM, VIRTIO_F_IN_ORDER,
     VIRTIO_F_VERSION_1, VirtioCommon, VirtioDevice, VirtioDeviceType, VirtioInterrupt,
     VirtioInterruptType,
 };
@@ -323,6 +323,8 @@ pub struct Vsock<B: VsockBackend> {
 pub struct VsockState {
     pub avail_features: u64,
     pub acked_features: u64,
+    #[serde(default)]
+    pub connections: Vec<(u32, u32)>,
 }
 
 impl<B> Vsock<B>
@@ -336,7 +338,7 @@ where
         id: String,
         cid: u32,
         path: PathBuf,
-        backend: B,
+        mut backend: B,
         iommu: bool,
         seccomp_action: SeccompAction,
         exit_evt: EventFd,
@@ -344,12 +346,15 @@ where
     ) -> io::Result<Vsock<B>> {
         let (avail_features, acked_features, paused) = if let Some(state) = state {
             info!("Restoring virtio-vsock {id}");
+            // Instead of letting the guest connection hang/timeout, proactively let
+            // the guest know the connection is gone.
+            backend.queue_rst_for_connections(state.connections.clone());
             (state.avail_features, state.acked_features, true)
         } else {
             let mut avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_F_IN_ORDER);
 
             if iommu {
-                avail_features |= 1u64 << VIRTIO_F_IOMMU_PLATFORM;
+                avail_features |= 1u64 << VIRTIO_F_ACCESS_PLATFORM;
             }
             (avail_features, 0, false)
         };
@@ -378,6 +383,7 @@ where
         VsockState {
             avail_features: self.common.avail_features,
             acked_features: self.common.acked_features,
+            connections: self.backend.read().unwrap().connections(),
         }
     }
 
@@ -435,12 +441,13 @@ where
         }
     }
 
-    fn activate(
-        &mut self,
-        mem: GuestMemoryAtomic<GuestMemoryMmap>,
-        interrupt_cb: Arc<dyn VirtioInterrupt>,
-        queues: Vec<(usize, Queue, EventFd)>,
-    ) -> ActivateResult {
+    fn activate(&mut self, context: crate::device::ActivationContext) -> ActivateResult {
+        let crate::device::ActivationContext {
+            mem,
+            interrupt_cb,
+            queues,
+            ..
+        } = context;
         self.common.activate(&queues, interrupt_cb.clone())?;
         let (kill_evt, pause_evt) = self.common.dup_eventfds();
 
@@ -593,9 +600,12 @@ mod unit_tests {
         let memory = GuestMemoryAtomic::new(ctx.mem.clone());
 
         // Test a bad activation.
-        let bad_activate =
-            ctx.device
-                .activate(memory.clone(), Arc::new(NoopVirtioInterrupt {}), Vec::new());
+        let bad_activate = ctx.device.activate(crate::device::ActivationContext {
+            mem: memory.clone(),
+            interrupt_cb: Arc::new(NoopVirtioInterrupt {}),
+            queues: Vec::new(),
+            device_status: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        });
         match bad_activate {
             Err(ActivateError::BadActivate) => (),
             other => panic!("{other:?}"),
@@ -603,10 +613,10 @@ mod unit_tests {
 
         // Test a correct activation.
         ctx.device
-            .activate(
-                memory,
-                Arc::new(NoopVirtioInterrupt {}),
-                vec![
+            .activate(crate::device::ActivationContext {
+                mem: memory,
+                interrupt_cb: Arc::new(NoopVirtioInterrupt {}),
+                queues: vec![
                     (
                         0,
                         Queue::new(256).unwrap(),
@@ -623,7 +633,8 @@ mod unit_tests {
                         EventFd::new(EFD_NONBLOCK).unwrap(),
                     ),
                 ],
-            )
+                device_status: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            })
             .unwrap();
     }
 

@@ -16,14 +16,16 @@ use api_client::{
     Error as ApiClientError, simple_api_command, simple_api_command_with_fds,
     simple_api_full_command,
 };
-use clap::{Arg, ArgAction, ArgMatches, Command};
+#[cfg(feature = "dbus_api")]
+use clap::ArgAction;
+use clap::{Arg, ArgMatches, Command};
 use log::error;
 use option_parser::{ByteSized, ByteSizedParseError};
 use thiserror::Error;
 use vmm::config::RestoreConfig;
 use vmm::vm_config::{
-    DeviceConfig, DiskConfig, FsConfig, NetConfig, PmemConfig, UserDeviceConfig, VdpaConfig,
-    VsockConfig,
+    DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, NetConfig, PmemConfig,
+    UserDeviceConfig, VdpaConfig, VsockConfig,
 };
 #[cfg(feature = "dbus_api")]
 use zbus::{proxy, zvariant::Optional};
@@ -49,6 +51,8 @@ enum Error {
     AddDiskConfig(#[source] vmm::config::Error),
     #[error("Error parsing filesystem syntax")]
     AddFsConfig(#[source] vmm::config::Error),
+    #[error("Error parsing generic vhost-user syntax")]
+    AddGenericVhostUserConfig(#[source] vmm::config::Error),
     #[error("Error parsing persistent memory syntax")]
     AddPmemConfig(#[source] vmm::config::Error),
     #[error("Error parsing network syntax")]
@@ -67,6 +71,8 @@ enum Error {
     ReadingFile(#[source] std::io::Error),
     #[error("Invalid disk size")]
     InvalidDiskSize(#[source] ByteSizedParseError),
+    #[error("Error parsing send migration configuration")]
+    SendMigrationConfig(#[from] vmm::api::VmSendMigrationConfigError),
 }
 
 enum TargetApi<'a> {
@@ -83,6 +89,10 @@ trait DBusApi1 {
     fn vm_add_device(&self, device_config: &str) -> zbus::Result<Optional<String>>;
     fn vm_add_disk(&self, disk_config: &str) -> zbus::Result<Optional<String>>;
     fn vm_add_fs(&self, fs_config: &str) -> zbus::Result<Optional<String>>;
+    fn vm_add_generic_vhost_user(
+        &self,
+        generic_vhost_user_config: &str,
+    ) -> zbus::Result<Optional<String>>;
     fn vm_add_net(&self, net_config: &str) -> zbus::Result<Optional<String>>;
     fn vm_add_pmem(&self, pmem_config: &str) -> zbus::Result<Optional<String>>;
     fn vm_add_user_device(&self, vm_add_user_device: &str) -> zbus::Result<Optional<String>>;
@@ -153,6 +163,10 @@ impl<'a> DBusApi1ProxyBlocking<'a> {
 
     fn api_vm_add_fs(&self, fs_config: &str) -> ApiResult {
         self.print_response(self.vm_add_fs(fs_config))
+    }
+
+    fn api_vm_add_generic_vhost_user(&self, generic_vhost_user_config: &str) -> ApiResult {
+        self.print_response(self.vm_add_generic_vhost_user(generic_vhost_user_config))
     }
 
     fn api_vm_add_net(&self, net_config: &str) -> ApiResult {
@@ -398,6 +412,22 @@ fn rest_api_do_command(matches: &ArgMatches, socket: &mut UnixStream) -> ApiResu
             simple_api_command(socket, "PUT", "add-fs", Some(&fs_config))
                 .map_err(Error::HttpApiClient)
         }
+        Some("add-generic-vhost-user") => {
+            let device_config = add_generic_vhost_user_config(
+                matches
+                    .subcommand_matches("add-generic-vhost-user")
+                    .unwrap()
+                    .get_one::<String>("generic_vhost_user_config")
+                    .unwrap(),
+            )?;
+            simple_api_command(
+                socket,
+                "PUT",
+                "add-generic-vhost-user",
+                Some(&device_config),
+            )
+            .map_err(Error::HttpApiClient)
+        }
         Some("add-pmem") => {
             let pmem_config = add_pmem_config(
                 matches
@@ -493,11 +523,7 @@ fn rest_api_do_command(matches: &ArgMatches, socket: &mut UnixStream) -> ApiResu
                     .unwrap()
                     .get_one::<String>("send_migration_config")
                     .unwrap(),
-                matches
-                    .subcommand_matches("send-migration")
-                    .unwrap()
-                    .get_flag("send_migration_local"),
-            );
+            )?;
             simple_api_command(socket, "PUT", "send-migration", Some(&send_migration_data))
                 .map_err(Error::HttpApiClient)
         }
@@ -620,6 +646,16 @@ fn dbus_api_do_command(matches: &ArgMatches, proxy: &DBusApi1ProxyBlocking<'_>) 
             )?;
             proxy.api_vm_add_fs(&fs_config)
         }
+        Some("add-generic-vhost-user") => {
+            let generic_vhost_user_config = add_generic_vhost_user_config(
+                matches
+                    .subcommand_matches("add-generic-vhost-user")
+                    .unwrap()
+                    .get_one::<String>("generic_vhost_user_config")
+                    .unwrap(),
+            )?;
+            proxy.api_vm_add_generic_vhost_user(&generic_vhost_user_config)
+        }
         Some("add-pmem") => {
             let pmem_config = add_pmem_config(
                 matches
@@ -707,11 +743,7 @@ fn dbus_api_do_command(matches: &ArgMatches, proxy: &DBusApi1ProxyBlocking<'_>) 
                     .unwrap()
                     .get_one::<String>("send_migration_config")
                     .unwrap(),
-                matches
-                    .subcommand_matches("send-migration")
-                    .unwrap()
-                    .get_flag("send_migration_local"),
-            );
+            )?;
             proxy.api_vm_send_migration(&send_migration_data)
         }
         Some("receive-migration") => {
@@ -835,6 +867,14 @@ fn add_fs_config(config: &str) -> Result<String, Error> {
     Ok(fs_config)
 }
 
+fn add_generic_vhost_user_config(config: &str) -> Result<String, Error> {
+    let generic_vhost_user_config =
+        GenericVhostUserConfig::parse(config).map_err(Error::AddGenericVhostUserConfig)?;
+    let generic_vhost_user_config = serde_json::to_string(&generic_vhost_user_config).unwrap();
+
+    Ok(generic_vhost_user_config)
+}
+
 fn add_pmem_config(config: &str) -> Result<String, Error> {
     let pmem_config = PmemConfig::parse(config).map_err(Error::AddPmemConfig)?;
     let pmem_config = serde_json::to_string(&pmem_config).unwrap();
@@ -909,13 +949,11 @@ fn receive_migration_data(url: &str) -> String {
     serde_json::to_string(&receive_migration_data).unwrap()
 }
 
-fn send_migration_data(url: &str, local: bool) -> String {
-    let send_migration_data = vmm::api::VmSendMigrationData {
-        destination_url: url.to_owned(),
-        local,
-    };
-
-    serde_json::to_string(&send_migration_data).unwrap()
+fn send_migration_data(config: &str) -> Result<String, Error> {
+    let send_migration_data =
+        vmm::api::VmSendMigrationData::parse(config).map_err(Error::SendMigrationConfig)?;
+    let send_migration_config = serde_json::to_string(&send_migration_data).unwrap();
+    Ok(send_migration_config)
 }
 
 fn create_data(path: &str) -> Result<String, Error> {
@@ -980,6 +1018,13 @@ fn get_cli_commands_sorted() -> Box<[Command]> {
                 Arg::new("fs_config")
                     .index(1)
                     .help(vmm::vm_config::FsConfig::SYNTAX),
+            ),
+        Command::new("add-generic-vhost-user")
+            .about("Add generic vhost-user device")
+            .arg(
+                Arg::new("generic_vhost_user_config")
+                    .index(1)
+                    .help(vmm::vm_config::GenericVhostUserConfig::SYNTAX),
             ),
         Command::new("add-net")
             .about("Add network device")
@@ -1090,13 +1135,7 @@ fn get_cli_commands_sorted() -> Box<[Command]> {
             .arg(
                 Arg::new("send_migration_config")
                     .index(1)
-                    .help("<destination_url>"),
-            )
-            .arg(
-                Arg::new("send_migration_local")
-                    .long("local")
-                    .num_args(0)
-                    .action(ArgAction::SetTrue),
+                    .help(vmm::api::VmSendMigrationData::SYNTAX),
             ),
         Command::new("shutdown").about("Shutdown the VM"),
         Command::new("shutdown-vmm").about("Shutdown the VMM"),

@@ -7,13 +7,13 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self};
+use std::io::{self, Read as _, Seek, SeekFrom};
 use std::ops::{BitAnd, Not, Sub};
-#[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Barrier, Mutex};
 use std::{ffi, result, thread};
 
@@ -25,9 +25,7 @@ use devices::ioapic;
 #[cfg(target_arch = "aarch64")]
 use hypervisor::HypervisorVmError;
 use libc::_SC_NPROCESSORS_ONLN;
-#[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
-use log::debug;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracer::trace_scoped;
@@ -37,24 +35,40 @@ use vm_allocator::GsiApic;
 use vm_allocator::{AddressAllocator, MemorySlotAllocator, SystemAllocator};
 use vm_device::BusDevice;
 use vm_memory::bitmap::AtomicBitmap;
-use vm_memory::guest_memory::FileOffset;
+use vm_memory::guest_memory::{Error as MmapError, FileOffset};
 use vm_memory::mmap::MmapRegionError;
 use vm_memory::{
-    Address, Error as MmapError, GuestAddress, GuestAddressSpace, GuestMemory, GuestMemoryAtomic,
-    GuestMemoryError, GuestMemoryRegion, GuestUsize, MmapRegion, ReadVolatile,
+    Address, Bytes, GuestAddress, GuestAddressSpace, GuestMemory, GuestMemoryAtomic,
+    GuestMemoryError, GuestMemoryRegion, GuestUsize, MmapRegion,
 };
 use vm_migration::protocol::{MemoryRange, MemoryRangeTable};
 use vm_migration::{
     Migratable, MigratableError, Pausable, Snapshot, SnapshotData, Snapshottable, Transportable,
+    UffdError,
 };
+use vmm_sys_util::eventfd::EventFd;
 
+use crate::config::MemoryRestoreMode;
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::coredump::{
     CoredumpMemoryRegion, CoredumpMemoryRegions, DumpState, GuestDebuggableError,
 };
 use crate::migration::url_to_path;
 use crate::vm_config::{HotplugMethod, MemoryConfig, MemoryZoneConfig};
-use crate::{GuestMemoryMmap, GuestRegionMmap, MEMORY_MANAGER_SNAPSHOT_ID};
+use crate::{GuestMemoryMmap, GuestRegionMmap, MEMORY_MANAGER_SNAPSHOT_ID, uffd};
+
+struct UffdHandler {
+    stop_event: EventFd,
+    result_rx: Receiver<Result<(), io::Error>>,
+    handle: thread::JoinHandle<()>,
+}
+
+struct UffdRange {
+    host_addr: u64,
+    length: u64,
+    file_offset: u64,
+    page_size: u64,
+}
 
 pub const MEMORY_MANAGER_ACPI_SIZE: usize = 0x18;
 
@@ -118,13 +132,25 @@ impl VirtioMemZone {
     }
 }
 
-#[derive(Default)]
 pub struct MemoryZone {
     regions: Vec<Arc<GuestRegionMmap>>,
     virtio_mem_zone: Option<VirtioMemZone>,
+    shared: bool,
+    hugepages: bool,
+    backing_page_size: u64,
 }
 
 impl MemoryZone {
+    fn new(shared: bool, hugepages: bool, backing_page_size: u64) -> Self {
+        Self {
+            regions: Vec::new(),
+            virtio_mem_zone: None,
+            shared,
+            hugepages,
+            backing_page_size,
+        }
+    }
+
     pub fn regions(&self) -> &Vec<Arc<GuestRegionMmap>> {
         &self.regions
     }
@@ -133,6 +159,21 @@ impl MemoryZone {
     }
     pub fn virtio_mem_zone_mut(&mut self) -> Option<&mut VirtioMemZone> {
         self.virtio_mem_zone.as_mut()
+    }
+
+    fn backing_page_size_for_gpa(&self, gpa: u64) -> Option<u64> {
+        if self.regions.iter().any(|region| {
+            let start = region.start_addr().raw_value();
+            gpa >= start && gpa < start + region.len()
+        }) {
+            return Some(self.backing_page_size);
+        }
+
+        self.virtio_mem_zone.as_ref().and_then(|virtio_mem_zone| {
+            let start = virtio_mem_zone.region.start_addr().raw_value();
+            (gpa >= start && gpa < start + virtio_mem_zone.region.len())
+                .then_some(self.backing_page_size)
+        })
     }
 }
 
@@ -189,6 +230,7 @@ pub struct MemoryManager {
     // This is useful for getting the dirty pages as we need to know the
     // slots that the mapping is created in.
     guest_ram_mappings: Vec<GuestRamMapping>,
+    uffd_handler: Option<UffdHandler>,
 
     pub acpi_address: Option<GuestAddress>,
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
@@ -208,6 +250,10 @@ pub enum Error {
     /// Mmap backed guest memory error
     #[error("Mmap backed guest memory error")]
     GuestMemory(#[source] MmapError),
+
+    /// Guest region collection error
+    #[error("Guest region collection error")]
+    GuestRegionCollection(#[source] vm_memory::GuestRegionCollectionError),
 
     /// Failed to allocate a memory range.
     #[error("Failed to allocate a memory range")]
@@ -350,6 +396,12 @@ pub enum Error {
     /// Memory size is misaligned with default page size or its hugepage size
     #[error("Memory size is misaligned with default page size or its hugepage size")]
     MisalignedMemorySize,
+}
+
+impl From<UffdError> for Error {
+    fn from(e: UffdError) -> Self {
+        Error::Restore(MigratableError::OnDemandRestore(e))
+    }
 }
 
 const ENABLE_FLAG: usize = 0;
@@ -553,7 +605,10 @@ impl MemoryManager {
         }
 
         // Add zone id to the list of memory zones.
-        memory_zones.insert(zone.id.clone(), MemoryZone::default());
+        memory_zones.insert(
+            zone.id.clone(),
+            MemoryZone::new(zone.shared, zone.hugepages, zone_align_size),
+        );
 
         for ram_region in ram_regions.iter() {
             let mut ram_region_offset = 0;
@@ -644,7 +699,10 @@ impl MemoryManager {
                         );
                         return Err(Error::DuplicateZoneId);
                     }
-                    memory_zones.insert(zone.id.clone(), MemoryZone::default());
+                    memory_zones.insert(
+                        zone.id.clone(),
+                        MemoryZone::new(zone.shared, zone.hugepages, zone_align_size),
+                    );
                 }
 
                 if ram_region_consumed {
@@ -672,7 +730,11 @@ impl MemoryManager {
         let mut memory_zones = HashMap::new();
 
         for zone_config in zones_config {
-            memory_zones.insert(zone_config.id.clone(), MemoryZone::default());
+            let zone_page_size = memory_zone_get_align_size(zone_config)?;
+            memory_zones.insert(
+                zone_config.id.clone(),
+                MemoryZone::new(zone_config.shared, zone_config.hugepages, zone_page_size),
+            );
         }
 
         for guest_ram_mapping in guest_ram_mappings {
@@ -760,6 +822,360 @@ impl MemoryManager {
         }
 
         Ok(())
+    }
+
+    /// Restore guest memory using userfaultfd for lazy demand paging.
+    ///
+    /// Instead of reading the entire snapshot into guest RAM upfront (which
+    /// blocks restore for hundreds of milliseconds at multi-GB sizes), this
+    /// registers the guest memory regions with a userfaultfd. A background
+    /// thread handles page faults by reading the corresponding page from the
+    /// snapshot file and copying it into guest memory via `UFFDIO_COPY`.
+    ///
+    /// This preserves the original memory mapping type (anonymous or shared),
+    /// making it compatible with VFIO device passthrough and shared-memory
+    /// guest RAM.
+    ///
+    /// Fails the restore if UFFD setup cannot be completed successfully.
+    ///
+    /// The handler thread keeps the snapshot file open while lazy restore
+    /// is active. The file must remain available until the VM is shut down or
+    /// all faulted pages have been served.
+    fn restore_by_uffd(
+        &mut self,
+        file_path: &Path,
+        saved_regions: &MemoryRangeTable,
+        exit_evt: &EventFd,
+    ) -> Result<(), Error> {
+        if saved_regions.is_empty() {
+            return Ok(());
+        }
+
+        let guest_memory = self.guest_memory.memory();
+        let required_uffd_features = self.required_uffd_features();
+
+        // SAFETY: FFI call. Trivially safe.
+        let base_page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+
+        info!(
+            "UFFD restore: attempting demand-paged restore for {} region(s)",
+            saved_regions.regions().len()
+        );
+
+        if saved_regions
+            .regions()
+            .iter()
+            .any(|range| range.gpa % base_page_size != 0 || range.length % base_page_size != 0)
+        {
+            return Err(UffdError::UnalignedRanges.into());
+        }
+
+        let snapshot_file = File::open(file_path).map_err(Error::SnapshotOpen)?;
+
+        let uffd_fd = uffd::create(required_uffd_features).map_err(UffdError::Create)?;
+
+        let mut handler_ranges: Vec<UffdRange> = Vec::new();
+        let mut file_offset: u64 = 0;
+
+        for range in saved_regions.regions() {
+            let host_addr = guest_memory
+                .get_host_address(GuestAddress(range.gpa))
+                .map_err(|_| UffdError::GpaTranslation { gpa: range.gpa })?
+                as u64;
+
+            let ioctls = uffd::register(uffd_fd.as_fd(), host_addr, range.length).map_err(|e| {
+                UffdError::Register {
+                    addr: host_addr,
+                    len: range.length,
+                    source: e,
+                }
+            })?;
+
+            if ioctls & crate::userfaultfd::UFFD_API_RANGE_IOCTLS_BASIC
+                != crate::userfaultfd::UFFD_API_RANGE_IOCTLS_BASIC
+            {
+                return Err(UffdError::MissingIoctlSupport {
+                    addr: host_addr,
+                    len: range.length,
+                }
+                .into());
+            }
+
+            let range_page_size = self
+                .memory_zones
+                .values()
+                .find_map(|zone| zone.backing_page_size_for_gpa(range.gpa))
+                .unwrap_or(base_page_size);
+
+            handler_ranges.push(UffdRange {
+                host_addr,
+                length: range.length,
+                file_offset,
+                page_size: range_page_size,
+            });
+
+            file_offset += range.length;
+        }
+
+        info!(
+            "UFFD restore: registered {} region(s), {} total bytes, spawning handler",
+            handler_ranges.len(),
+            file_offset
+        );
+
+        let stop_event = EventFd::new(libc::EFD_NONBLOCK).map_err(Error::EventFdFail)?;
+        let thread_stop_event = stop_event.try_clone().map_err(Error::EventFdFail)?;
+        let thread_exit_evt = exit_evt.try_clone().map_err(Error::EventFdFail)?;
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let handle = thread::Builder::new()
+            .name("uffd-handler".to_string())
+            .spawn(move || {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    let max_page_size = handler_ranges
+                        .iter()
+                        .map(|r| r.page_size)
+                        .max()
+                        .unwrap_or(base_page_size);
+                    let result = Self::uffd_handler_loop(
+                        uffd_fd,
+                        thread_stop_event,
+                        snapshot_file,
+                        &handler_ranges,
+                        max_page_size,
+                        &ready_tx,
+                    );
+
+                    if let Err(e) = &result {
+                        error!("UFFD handler exited with error: {e}");
+                    }
+
+                    result_tx.send(result).ok();
+                }))
+                .map_err(|_| {
+                    error!("uffd-handler thread panicked");
+                    thread_exit_evt.write(1).ok();
+                })
+                .ok();
+            })
+            .map_err(UffdError::SpawnThread)?;
+
+        if ready_rx.recv().is_err() {
+            handle.join().ok();
+            return Err(UffdError::HandlerStartup.into());
+        }
+
+        if let Ok(Err(e)) = result_rx.try_recv() {
+            handle.join().ok();
+            return Err(UffdError::HandlerFailed(e).into());
+        }
+
+        self.uffd_handler = Some(UffdHandler {
+            stop_event,
+            result_rx,
+            handle,
+        });
+
+        info!("UFFD restore: demand-paged restore enabled");
+
+        Ok(())
+    }
+
+    fn required_uffd_features(&self) -> u64 {
+        let mut features = 0u64;
+        if self.memory_zones.values().any(|z| z.shared && !z.hugepages) {
+            features |= crate::userfaultfd::UFFD_FEATURE_MISSING_SHMEM;
+        }
+        if self.memory_zones.values().any(|z| z.hugepages) {
+            features |= crate::userfaultfd::UFFD_FEATURE_MISSING_HUGETLBFS;
+        }
+        features
+    }
+
+    fn stop_uffd_handler(&mut self) {
+        if let Some(uffd_handler) = self.uffd_handler.take() {
+            uffd_handler.stop_event.write(1).ok();
+            uffd_handler.handle.join().ok();
+
+            match uffd_handler.result_rx.try_recv() {
+                Ok(Err(e)) => error!("UFFD handler terminated with error: {e}"),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    warn!("UFFD handler terminated unexpectedly (possible panic)");
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Poll the UFFD fd and serve page faults from the snapshot file.
+    ///
+    /// Runs until the fd is closed (EPOLLHUP) or an unrecoverable error occurs.
+    /// Each fault triggers a seek + read from the snapshot file followed by a
+    /// `UFFDIO_COPY` to resolve the fault and wake the faulting thread.
+    #[allow(clippy::needless_pass_by_value)]
+    fn uffd_handler_loop(
+        uffd_fd: OwnedFd,
+        stop_event: EventFd,
+        mut snapshot_file: File,
+        ranges: &[UffdRange],
+        page_size: u64,
+        ready_tx: &SyncSender<()>,
+    ) -> Result<(), io::Error> {
+        let uffd_raw_fd = uffd_fd.as_raw_fd();
+        let mut page_buf = vec![0u8; page_size as usize];
+
+        let total_pages: u64 = ranges.iter().map(|r| r.length.div_ceil(r.page_size)).sum();
+        let mut pages_served: u64 = 0;
+
+        const EVENT_STOP: u64 = 0;
+        const EVENT_UFFD: u64 = 1;
+
+        let epoll_fd = epoll::create(true).map_err(io::Error::other)?;
+        // SAFETY: epoll_fd is valid and owned by this scope.
+        let _epoll_file = unsafe { File::from_raw_fd(epoll_fd) };
+
+        epoll::ctl(
+            epoll_fd,
+            epoll::ControlOptions::EPOLL_CTL_ADD,
+            stop_event.as_raw_fd(),
+            epoll::Event::new(epoll::Events::EPOLLIN, EVENT_STOP),
+        )
+        .map_err(io::Error::other)?;
+
+        epoll::ctl(
+            epoll_fd,
+            epoll::ControlOptions::EPOLL_CTL_ADD,
+            uffd_raw_fd,
+            epoll::Event::new(epoll::Events::EPOLLIN | epoll::Events::EPOLLHUP, EVENT_UFFD),
+        )
+        .map_err(io::Error::other)?;
+
+        ready_tx.send(()).ok();
+
+        let mut events = vec![epoll::Event::new(epoll::Events::empty(), 0); 2];
+        loop {
+            let num_events = match epoll::wait(epoll_fd, -1, &mut events) {
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+
+            let mut got_uffd_data = false;
+            for event in events.iter().take(num_events) {
+                let token = event.data;
+                let evt_flags = event.events;
+
+                if token == EVENT_STOP {
+                    stop_event.read().ok();
+                    info!("UFFD handler: received stop event, exiting");
+                    return Ok(());
+                }
+
+                if token == EVENT_UFFD
+                    && (evt_flags & epoll::Events::EPOLLHUP.bits()) != 0
+                    && (evt_flags & epoll::Events::EPOLLIN.bits()) == 0
+                {
+                    info!("UFFD handler: fd closed (EPOLLHUP), exiting");
+                    return Ok(());
+                }
+
+                if token == EVENT_UFFD && (evt_flags & epoll::Events::EPOLLIN.bits()) != 0 {
+                    got_uffd_data = true;
+                }
+            }
+
+            if !got_uffd_data {
+                continue;
+            }
+
+            // SAFETY: UffdMsg is a plain repr(C) struct, safe to zero-init.
+            let mut msg: uffd::UffdMsg = unsafe { std::mem::zeroed() };
+            // SAFETY: reading a uffd_msg-sized struct from the valid uffd fd.
+            let n = unsafe {
+                libc::read(
+                    uffd_raw_fd,
+                    &mut msg as *mut uffd::UffdMsg as *mut libc::c_void,
+                    std::mem::size_of::<uffd::UffdMsg>(),
+                )
+            };
+            if n < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::WouldBlock {
+                    continue;
+                }
+                return Err(err);
+            }
+            if n == 0 {
+                info!("UFFD handler: EOF on fd, exiting");
+                return Ok(());
+            }
+            if n as usize != std::mem::size_of::<uffd::UffdMsg>() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Short read from userfaultfd",
+                ));
+            }
+
+            if msg.event != crate::userfaultfd::UFFD_EVENT_PAGEFAULT {
+                continue;
+            }
+
+            let fault_addr = msg.pf_address;
+
+            let mut served = false;
+            for range in ranges {
+                // Round down to the page boundary containing the faulted address.
+                let page_addr = fault_addr & !(range.page_size - 1);
+                if page_addr >= range.host_addr && page_addr < range.host_addr + range.length {
+                    let offset_in_range = page_addr - range.host_addr;
+                    let file_pos = range.file_offset + offset_in_range;
+
+                    snapshot_file.seek(SeekFrom::Start(file_pos))?;
+                    snapshot_file.read_exact(&mut page_buf[..range.page_size as usize])?;
+
+                    loop {
+                        match uffd::copy(
+                            uffd_fd.as_fd(),
+                            page_addr,
+                            page_buf.as_ptr(),
+                            range.page_size,
+                        ) {
+                            Ok(()) => {
+                                pages_served += 1;
+                                break;
+                            }
+                            Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
+                                if let Err(e) =
+                                    uffd::wake(uffd_fd.as_fd(), page_addr, range.page_size)
+                                {
+                                    warn!("UFFDIO_WAKE failed at {page_addr:#x}: {e}");
+                                }
+                                break;
+                            }
+                            Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => {
+                                // The kernel can report a transient EAGAIN while the fault
+                                // is being resolved; yield and retry instead of aborting restore.
+                                thread::yield_now();
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    served = true;
+                    break;
+                }
+            }
+
+            if !served {
+                return Err(io::Error::other(format!(
+                    "UFFD handler: fault at {fault_addr:#x} does not belong to any registered range",
+                )));
+            }
+
+            if pages_served == total_pages {
+                info!("UFFD handler: all {pages_served} pages served, exiting");
+                return Ok(());
+            }
+        }
     }
 
     fn validate_memory_config(
@@ -956,9 +1372,9 @@ impl MemoryManager {
         Ok(())
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     pub fn add_uefi_flash(&mut self) -> Result<(), Error> {
-        // On AArch64, the UEFI binary requires a flash device at address 0.
+        // The UEFI binary requires a flash device at address 0.
         // 4 MiB memory is mapped to simulate the flash.
         let uefi_mem_slot = self.allocate_memory_slot();
         let uefi_region = GuestRegionMmap::new(
@@ -1036,7 +1452,7 @@ impl MemoryManager {
                 config.thp,
             )?;
             let guest_memory =
-                GuestMemoryMmap::from_arc_regions(regions).map_err(Error::GuestMemory)?;
+                GuestMemoryMmap::from_arc_regions(regions).map_err(Error::GuestRegionCollection)?;
             let boot_guest_memory = guest_memory.clone();
             (
                 GuestAddress(data.start_of_device_area),
@@ -1073,8 +1489,8 @@ impl MemoryManager {
             let (mem_regions, mut memory_zones) =
                 Self::create_memory_regions_from_zones(&ram_regions, &zones, prefault, config.thp)?;
 
-            let mut guest_memory =
-                GuestMemoryMmap::from_arc_regions(mem_regions).map_err(Error::GuestMemory)?;
+            let mut guest_memory = GuestMemoryMmap::from_arc_regions(mem_regions)
+                .map_err(Error::GuestRegionCollection)?;
 
             let boot_guest_memory = guest_memory.clone();
 
@@ -1122,7 +1538,7 @@ impl MemoryManager {
 
                             guest_memory = guest_memory
                                 .insert_region(Arc::clone(&region))
-                                .map_err(Error::GuestMemory)?;
+                                .map_err(Error::GuestRegionCollection)?;
 
                             let hotplugged_size = zone.hotplugged_size.unwrap_or(0);
                             let region_size = region.len();
@@ -1229,6 +1645,7 @@ impl MemoryManager {
             snapshot_memory_ranges: MemoryRangeTable::default(),
             memory_zones,
             guest_ram_mappings: Vec::new(),
+            uffd_handler: None,
             acpi_address,
             log_dirty: dynamic, // Cannot log dirty pages on a TD
             arch_mem_regions,
@@ -1242,13 +1659,16 @@ impl MemoryManager {
         Ok(Arc::new(Mutex::new(memory_manager)))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_from_snapshot(
         snapshot: &Snapshot,
         vm: Arc<dyn hypervisor::Vm>,
         config: &MemoryConfig,
         source_url: Option<&str>,
         prefault: bool,
+        memory_restore_mode: MemoryRestoreMode,
         phys_bits: u8,
+        exit_evt: &EventFd,
     ) -> Result<Arc<Mutex<MemoryManager>>, Error> {
         if let Some(source_url) = source_url {
             let mut memory_file_path = url_to_path(source_url).map_err(Error::Restore)?;
@@ -1268,9 +1688,17 @@ impl MemoryManager {
                 Default::default(),
             )?;
 
-            mm.lock()
-                .unwrap()
-                .fill_saved_regions(memory_file_path, &mem_snapshot.memory_ranges)?;
+            if memory_restore_mode == MemoryRestoreMode::OnDemand {
+                mm.lock().unwrap().restore_by_uffd(
+                    &memory_file_path,
+                    &mem_snapshot.memory_ranges,
+                    exit_evt,
+                )?;
+            } else {
+                mm.lock()
+                    .unwrap()
+                    .fill_saved_regions(memory_file_path, &mem_snapshot.memory_ranges)?;
+            }
 
             Ok(mm)
         } else {
@@ -1490,17 +1918,20 @@ impl MemoryManager {
             });
         }
 
-        if region.file_offset().is_none() && thp {
-            info!(
-                "Anonymous mapping at 0x{:x} (size = 0x{:x})",
-                region.as_ptr() as u64,
-                size
-            );
+        info!(
+            "RAM region mapping at 0x{:x} (size = 0x{:x})",
+            region.as_ptr() as u64,
+            size
+        );
+
+        if thp && !hugepages {
             // SAFETY: FFI call with correct arguments
             let ret = unsafe { libc::madvise(region.as_ptr() as _, size, libc::MADV_HUGEPAGE) };
             if ret != 0 {
                 let e = io::Error::last_os_error();
                 warn!("Failed to mark pages as THP eligible: {e}");
+            } else {
+                debug!("Successfully marked pages as THP eligible");
             }
         }
 
@@ -1534,9 +1965,9 @@ impl MemoryManager {
             thp,
         )?;
 
-        Ok(Arc::new(
-            GuestRegionMmap::new(r, start_addr).map_err(Error::GuestMemory)?,
-        ))
+        Ok(Arc::new(GuestRegionMmap::new(r, start_addr).ok_or(
+            Error::GuestMemory(MmapError::InvalidGuestAddress(start_addr)),
+        )?))
     }
 
     // Duplicate of `memory_zone_get_align_size` that does not require a `zone`
@@ -1597,7 +2028,7 @@ impl MemoryManager {
             .guest_memory
             .memory()
             .insert_region(region)
-            .map_err(Error::GuestMemory)?;
+            .map_err(Error::GuestRegionCollection)?;
         self.guest_memory.lock().unwrap().replace(guest_memory);
 
         Ok(())
@@ -1989,6 +2420,19 @@ impl MemoryManager {
         unsafe { (*stat.as_ptr()).st_nlink as usize > 0 }
     }
 
+    pub fn virtio_mem_plugged_size(&self) -> u64 {
+        self.memory_zones
+            .values()
+            .filter_map(|zone| {
+                zone.virtio_mem_zone
+                    .as_ref()?
+                    .virtio_device
+                    .as_ref()
+                    .map(|dev| dev.lock().unwrap().plugged_size())
+            })
+            .sum()
+    }
+
     pub fn memory_zones(&self) -> &MemoryZones {
         &self.memory_zones
     }
@@ -2139,47 +2583,6 @@ impl MemoryManager {
         }
 
         debug!("coredump total bytes {total_bytes}");
-        Ok(())
-    }
-
-    pub fn receive_memory_regions<F>(
-        &mut self,
-        ranges: &MemoryRangeTable,
-        fd: &mut F,
-    ) -> std::result::Result<(), MigratableError>
-    where
-        F: ReadVolatile,
-    {
-        let guest_memory = self.guest_memory();
-        let mem = guest_memory.memory();
-
-        for range in ranges.regions() {
-            let mut offset: u64 = 0;
-            // Here we are manually handling the retry in case we can't the
-            // whole region at once because we can't use the implementation
-            // from vm-memory::GuestMemory of read_exact_from() as it is not
-            // following the correct behavior. For more info about this issue
-            // see: https://github.com/rust-vmm/vm-memory/issues/174
-            loop {
-                let bytes_read = mem
-                    .read_volatile_from(
-                        GuestAddress(range.gpa + offset),
-                        fd,
-                        (range.length - offset) as usize,
-                    )
-                    .map_err(|e| {
-                        MigratableError::MigrateReceive(anyhow!(
-                            "Error receiving memory from socket: {e}"
-                        ))
-                    })?;
-                offset += bytes_read as u64;
-
-                if offset == range.length {
-                    break;
-                }
-            }
-        }
-
         Ok(())
     }
 }
@@ -2529,6 +2932,12 @@ impl Aml for MemoryManager {
 
 impl Pausable for MemoryManager {}
 
+impl Drop for MemoryManager {
+    fn drop(&mut self) {
+        self.stop_uffd_handler();
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct MemoryManagerSnapshotData {
     memory_ranges: MemoryRangeTable,
@@ -2672,11 +3081,11 @@ impl Migratable for MemoryManager {
             let sub_table = MemoryRangeTable::from_dirty_bitmap(dirty_bitmap, r.gpa, 4096);
 
             if sub_table.regions().is_empty() {
-                info!("Dirty Memory Range Table is empty");
+                debug!("Dirty Memory Range Table is empty");
             } else {
-                info!("Dirty Memory Range Table:");
+                debug!("Dirty Memory Range Table:");
                 for range in sub_table.regions() {
-                    info!("GPA: {:x} size: {} (KiB)", range.gpa, range.length / 1024);
+                    debug!("GPA: {:x} size: {} (KiB)", range.gpa, range.length / 1024);
                 }
             }
 

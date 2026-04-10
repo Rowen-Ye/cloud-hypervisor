@@ -17,7 +17,7 @@ use std::io::Write;
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use std::mem::size_of;
 use std::os::unix::thread::JoinHandleExt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::{cmp, io, result, thread};
 
@@ -92,7 +92,7 @@ use crate::gdb::{Debuggable, DebuggableError, get_raw_tid};
 use crate::seccomp_filters::{Thread, get_seccomp_filter};
 #[cfg(target_arch = "x86_64")]
 use crate::vm::physical_bits;
-use crate::vm_config::CpusConfig;
+use crate::vm_config::{CoreScheduling, CpusConfig};
 use crate::{CPU_MANAGER_SNAPSHOT_ID, GuestMemoryMmap};
 
 #[cfg(all(target_arch = "aarch64", feature = "guest_debug"))]
@@ -220,8 +220,94 @@ pub enum Error {
     #[cfg(feature = "mshv")]
     #[error("Failed to set partition property")]
     SetPartitionProperty(#[source] anyhow::Error),
+
+    #[error("Error enabling core scheduling")]
+    CoreScheduling(#[source] io::Error),
 }
 pub type Result<T> = result::Result<T, Error>;
+
+const PR_SCHED_CORE: libc::c_int = 62;
+const PR_SCHED_CORE_GET: libc::c_int = 0;
+const PR_SCHED_CORE_CREATE: libc::c_int = 1;
+const PR_SCHED_CORE_SHARE_FROM: libc::c_int = 3;
+const PR_SCHED_CORE_SCOPE_THREAD: libc::c_int = 0;
+
+/// Create a new unique core scheduling cookie for the current thread.
+/// Silently succeeds on kernels that don't support PR_SCHED_CORE.
+fn core_scheduling_create() -> Result<()> {
+    // SAFETY: prctl with PR_SCHED_CORE_CREATE on the current thread (pid=0).
+    // All arguments are valid constants. We check the return value.
+    let ret = unsafe {
+        libc::prctl(
+            PR_SCHED_CORE,
+            PR_SCHED_CORE_CREATE,
+            0,
+            PR_SCHED_CORE_SCOPE_THREAD,
+            0,
+        )
+    };
+    if ret == -1 {
+        let err = io::Error::last_os_error();
+        // EINVAL: kernel < 5.14 where PR_SCHED_CORE is unknown.
+        // ENODEV: CONFIG_SCHED_CORE is enabled but SMT is not present/enabled,
+        //         so core scheduling is not applicable.
+        // Both mean core scheduling is unavailable; silently ignore.
+        match err.raw_os_error() {
+            Some(libc::EINVAL) => {
+                warn!("Kernel lacks CONFIG_SCHED_CORE support - no SMT isolation");
+            }
+            Some(libc::ENODEV) => {}
+            _ => return Err(Error::CoreScheduling(err)),
+        }
+    }
+    Ok(())
+}
+
+/// Copy the core scheduling cookie from the thread identified by `tid`
+/// to the current thread, placing both in the same scheduling group.
+/// Silently succeeds on kernels that don't support PR_SCHED_CORE.
+fn core_scheduling_share_from(tid: i32) -> Result<()> {
+    // SAFETY: prctl with PR_SCHED_CORE_SHARE_FROM targeting tid.
+    // All arguments are valid. We check the return value.
+    let ret = unsafe {
+        libc::prctl(
+            PR_SCHED_CORE,
+            PR_SCHED_CORE_SHARE_FROM,
+            tid,
+            PR_SCHED_CORE_SCOPE_THREAD,
+            0,
+        )
+    };
+    if ret == -1 {
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINVAL) | Some(libc::ENODEV) => {}
+            _ => return Err(Error::CoreScheduling(err)),
+        }
+    }
+    Ok(())
+}
+
+/// Read the core scheduling cookie of the current thread.
+/// Returns 0 if no cookie is set or the kernel doesn't support PR_SCHED_CORE.
+fn core_scheduling_cookie() -> u64 {
+    let mut cookie: u64 = 0;
+    // SAFETY: PR_SCHED_CORE_GET with pid=0 reads the current thread's cookie
+    // into the provided pointer. We pass a valid mutable reference.
+    let ret = unsafe {
+        libc::prctl(
+            PR_SCHED_CORE,
+            PR_SCHED_CORE_GET,
+            0,
+            PR_SCHED_CORE_SCOPE_THREAD,
+            &mut cookie as *mut u64,
+        )
+    };
+    if ret == -1 {
+        return 0;
+    }
+    cookie
+}
 
 #[cfg(target_arch = "x86_64")]
 #[allow(dead_code)]
@@ -609,6 +695,8 @@ pub struct CpuManager {
     hypervisor: Arc<dyn hypervisor::Hypervisor>,
     #[cfg(feature = "sev_snp")]
     sev_snp_enabled: bool,
+    // State of the core scheduling group leader election (VM mode).
+    core_scheduling_group_leader: Arc<AtomicI32>,
 }
 
 const CPU_ENABLE_FLAG: usize = 0;
@@ -618,6 +706,36 @@ const CPU_EJECT_FLAG: usize = 3;
 
 const CPU_STATUS_OFFSET: u64 = 4;
 const CPU_SELECTION_OFFSET: u64 = 0;
+
+/// State of the core scheduling group leader election for VM-wide cookie
+/// sharing.
+///
+/// The value will be in an `AtomicI32`. Positive values represent a leader
+/// TID (cookie ready).
+#[repr(i32)]
+enum CoreSchedulingLeader {
+    /// No leader elected yet.
+    Initial = 0,
+    /// A leader has been elected and is creating the cookie.
+    Elected = -1,
+    /// The leader failed to create the cookie.
+    Error = -2,
+}
+
+impl TryFrom<i32> for CoreSchedulingLeader {
+    type Error = ();
+    /// Convert from the raw `i32` (from the `AtomicI32`) value.
+    /// Quirky: Returns `Ok(state)` for known sentinel values, or `Err(())` for
+    /// a positive TID (cookie ready).
+    fn try_from(value: i32) -> result::Result<Self, ()> {
+        match value {
+            0 => Ok(Self::Initial),
+            -1 => Ok(Self::Elected),
+            -2 => Ok(Self::Error),
+            _ => Err(()),
+        }
+    }
+}
 
 impl BusDevice for CpuManager {
     fn read(&mut self, _base: u64, offset: u64, data: &mut [u8]) {
@@ -851,6 +969,9 @@ impl CpuManager {
             hypervisor,
             #[cfg(feature = "sev_snp")]
             sev_snp_enabled,
+            core_scheduling_group_leader: Arc::new(AtomicI32::new(
+                CoreSchedulingLeader::Initial as i32,
+            )),
         })))
     }
 
@@ -1079,6 +1200,9 @@ impl CpuManager {
             cpuset
         });
 
+        let core_scheduling = self.config.core_scheduling;
+        let core_scheduling_group_leader = self.core_scheduling_group_leader.clone();
+
         // Retrieve seccomp filter for vcpu thread
         let vcpu_seccomp_filter = get_seccomp_filter(
             &self.seccomp_action,
@@ -1115,6 +1239,67 @@ impl CpuManager {
                             );
                             return;
                         }
+                    }
+
+                    // Set up core scheduling before seccomp locks down prctl.
+                    match core_scheduling {
+                        CoreScheduling::Vcpu => {
+                            // Each vCPU gets its own unique cookie
+                            if let Err(e) = core_scheduling_create() {
+                                error!(
+                                    "Failed to enable core scheduling for vCPU {vcpu_id}: {e:?}"
+                                );
+                                return;
+                            }
+                        }
+                        CoreScheduling::Vm => {
+                            // First vCPU creates a cookie; all others share from it.
+                            // SAFETY: gettid() is always safe to call.
+                            let my_tid = unsafe { libc::gettid() };
+                            if core_scheduling_group_leader
+                                .compare_exchange(CoreSchedulingLeader::Initial as i32, CoreSchedulingLeader::Elected as i32, Ordering::AcqRel, Ordering::Acquire)
+                                .is_ok()
+                            {
+                                // We are the group leader — create the cookie
+                                if let Err(e) = core_scheduling_create() {
+                                    error!(
+                                        "Failed to create core scheduling cookie: {e:?}"
+                                    );
+                                    // This will force the loop in the other threads to break out
+                                    core_scheduling_group_leader.store(CoreSchedulingLeader::Error as i32, Ordering::Release);
+                                    return;
+                                }
+                                // Signal that the cookie is ready by storing real TID
+                                core_scheduling_group_leader
+                                    .store(my_tid, Ordering::Release);
+                            } else {
+                                // Wait for the leader to finish creating the cookie
+                                let leader_tid = loop {
+                                    let v = core_scheduling_group_leader.load(Ordering::Acquire);
+                                    match CoreSchedulingLeader::try_from(v) {
+                                        Ok(CoreSchedulingLeader::Error) => return,
+                                        Ok(CoreSchedulingLeader::Initial |
+                                             CoreSchedulingLeader::Elected) => std::hint::spin_loop(),
+                                        Err(()) => break v,
+                                    }
+                                };
+                                if let Err(e) = core_scheduling_share_from(leader_tid) {
+                                    error!(
+                                        "Failed to share core scheduling cookie \
+                                         to vCPU {vcpu_id}: {e:?}"
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+                        CoreScheduling::Off => {}
+                    }
+
+                    if core_scheduling != CoreScheduling::Off {
+                        info!(
+                            "vCPU {vcpu_id}: core scheduling cookie = {:#x}",
+                            core_scheduling_cookie()
+                        );
                     }
 
                     // Apply seccomp filter for vcpu thread.
@@ -2452,16 +2637,16 @@ impl Pausable for CpuManager {
         self.signal_vcpus()
             .map_err(|e| MigratableError::Pause(anyhow!("Error signalling vCPUs: {e}")))?;
 
+        // Notify all guests (including Hyper-V / Windows) that the clock was
+        // paused.  KVM_KVMCLOCK_CTRL updates internal KVM state that affects
+        // both pvclock (Linux) and the Hyper-V TSC reference page, so it must
+        // be called unconditionally.
         #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
         for vcpu in self.vcpus.iter() {
             let vcpu = vcpu.lock().unwrap();
-            if !self.config.kvm_hyperv {
-                vcpu.vcpu.notify_guest_clock_paused().map_err(|e| {
-                    MigratableError::Pause(anyhow!(
-                        "Could not notify guest it has been paused {e:?}"
-                    ))
-                })?;
-            }
+            vcpu.vcpu.notify_guest_clock_paused().map_err(|e| {
+                MigratableError::Pause(anyhow!("Could not notify guest it has been paused {e:?}"))
+            })?;
         }
 
         // The vCPU thread will change its paused state before parking, wait here for each
@@ -2577,7 +2762,7 @@ impl Debuggable for CpuManager {
         ];
 
         // GDB exposes 32-bit eflags instead of 64-bit rflags.
-        // https://github.com/bminor/binutils-gdb/blob/master/gdb/features/i386/64bit-core.xml
+        // https://sourceware.org/git/?p=binutils-gdb.git;a=blob;f=gdb/features/i386/64bit-core.xml
         let eflags = gregs.get_rflags() as u32;
         let rip = gregs.get_rip();
 

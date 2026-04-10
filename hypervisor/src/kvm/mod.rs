@@ -70,7 +70,8 @@ pub use x86_64::{CpuId, ExtendedControlRegisters, MsrEntries, VcpuKvmState};
 use crate::ClockData;
 #[cfg(target_arch = "x86_64")]
 use crate::arch::x86::{
-    CpuIdEntry, FpuState, LapicState, MsrEntry, NUM_IOAPIC_PINS, SpecialRegisters, XsaveState,
+    CpuIdEntry, FpuState, LapicState, MTRR_MSR_INDICES, MsrEntry, NUM_IOAPIC_PINS,
+    SpecialRegisters, XsaveState,
 };
 use crate::{CpuState, IoEventAddress, IrqRoutingEntry, MpState, StandardRegisters};
 // aarch64 dependencies
@@ -90,11 +91,11 @@ pub use kvm_bindings::kvm_vcpu_events as VcpuEvents;
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::nested::KvmNestedStateBuffer;
 pub use kvm_bindings::{
-    KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_SINGLESTEP, KVM_IRQ_ROUTING_IRQCHIP, KVM_IRQ_ROUTING_MSI,
-    KVM_MEM_LOG_DIRTY_PAGES, KVM_MEM_READONLY, KVM_MSI_VALID_DEVID, kvm_clock_data,
-    kvm_create_device, kvm_create_device as CreateDevice, kvm_device_attr as DeviceAttr,
-    kvm_device_type_KVM_DEV_TYPE_VFIO, kvm_guest_debug, kvm_irq_routing, kvm_irq_routing_entry,
-    kvm_mp_state, kvm_run, kvm_userspace_memory_region,
+    self, KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_SINGLESTEP, KVM_IRQ_ROUTING_IRQCHIP,
+    KVM_IRQ_ROUTING_MSI, KVM_MEM_LOG_DIRTY_PAGES, KVM_MEM_READONLY, KVM_MSI_VALID_DEVID,
+    kvm_clock_data, kvm_create_device, kvm_create_device as CreateDevice,
+    kvm_device_attr as DeviceAttr, kvm_device_type_KVM_DEV_TYPE_VFIO, kvm_guest_debug,
+    kvm_irq_routing, kvm_irq_routing_entry, kvm_mp_state, kvm_run, kvm_userspace_memory_region,
 };
 #[cfg(target_arch = "aarch64")]
 use kvm_bindings::{
@@ -109,14 +110,13 @@ use kvm_bindings::{KVM_REG_RISCV_CORE, kvm_riscv_core};
 use kvm_bindings::{KVM_X86_DEFAULT_VM, KVM_X86_SW_PROTECTED_VM, KVMIO, kvm_run__bindgen_ty_1};
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{Xsave as xsave2, kvm_xsave2};
-pub use kvm_ioctls::{Cap, Kvm, VcpuExit};
+pub use kvm_ioctls::{self, Cap, Kvm, VcpuExit};
 use thiserror::Error;
 use vfio_ioctls::VfioDeviceFd;
 #[cfg(target_arch = "x86_64")]
 use vmm_sys_util::{fam::FamStruct, ioctl_io_nr};
 #[cfg(feature = "tdx")]
 use vmm_sys_util::{ioctl::ioctl_with_val, ioctl_iowr_nr};
-pub use {kvm_bindings, kvm_ioctls};
 
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use crate::RegList;
@@ -428,10 +428,10 @@ struct KvmDirtyLogSlot {
 
 /// Wrapper over KVM VM ioctls.
 pub struct KvmVm {
-    fd: Arc<VmFd>,
+    fd: VmFd,
     #[cfg(target_arch = "x86_64")]
     msrs: Vec<MsrEntry>,
-    dirty_log_slots: Arc<RwLock<HashMap<u32, KvmDirtyLogSlot>>>,
+    dirty_log_slots: RwLock<HashMap<u32, KvmDirtyLogSlot>>,
 }
 
 impl KvmVm {
@@ -1129,9 +1129,21 @@ impl KvmHypervisor {
     /// Retrieve the list of MSRs supported by the hypervisor.
     ///
     fn get_msr_list(&self) -> hypervisor::Result<MsrList> {
-        self.kvm
+        let mut indices = self
+            .kvm
             .get_msr_index_list()
-            .map_err(|e| hypervisor::HypervisorError::GetMsrList(e.into()))
+            .map_err(|e| hypervisor::HypervisorError::GetMsrList(e.into()))?
+            .as_slice()
+            .to_vec();
+
+        // KVM_GET_MSR_INDEX_LIST does not include MTRR MSRs, but firmware may update them before an early boot snapshot.
+        indices.extend(MTRR_MSR_INDICES);
+
+        let mut msr_list = MsrList::new(indices.len())
+            .map_err(|e| hypervisor::HypervisorError::GetMsrList(e.into()))?;
+        msr_list.as_mut_slice().copy_from_slice(&indices);
+
+        Ok(msr_list)
     }
 }
 
@@ -1239,8 +1251,6 @@ impl hypervisor::Hypervisor for KvmHypervisor {
             break;
         }
 
-        let vm_fd = Arc::new(fd);
-
         #[cfg(target_arch = "x86_64")]
         {
             let msr_list = self.get_msr_list()?;
@@ -1257,17 +1267,17 @@ impl hypervisor::Hypervisor for KvmHypervisor {
             }
 
             Ok(Arc::new(KvmVm {
-                fd: vm_fd,
+                fd,
                 msrs,
-                dirty_log_slots: Arc::new(RwLock::new(HashMap::new())),
+                dirty_log_slots: RwLock::new(HashMap::new()),
             }))
         }
 
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         {
             Ok(Arc::new(KvmVm {
-                fd: vm_fd,
-                dirty_log_slots: Arc::new(RwLock::new(HashMap::new())),
+                fd,
+                dirty_log_slots: RwLock::new(HashMap::new()),
             }))
         }
     }
@@ -2994,7 +3004,7 @@ impl KvmVcpu {
 
         let maybe_size = self
             .fd
-            .get_nested_state(&mut buffer)
+            .nested_state(&mut buffer)
             .map_err(|e| cpu::HypervisorCpuError::GetNestedState(e.into()))?;
 
         if let Some(_size) = maybe_size {

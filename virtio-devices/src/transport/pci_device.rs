@@ -10,16 +10,17 @@ use std::any::Any;
 use std::cmp;
 use std::io::Write;
 use std::ops::Deref;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 
 use anyhow::anyhow;
 use libc::EFD_NONBLOCK;
 use log::{error, info};
 use pci::{
-    BarReprogrammingParams, MsixCap, MsixConfig, PciBarConfiguration, PciBarRegionType,
-    PciCapability, PciCapabilityId, PciClassCode, PciConfiguration, PciDevice, PciDeviceError,
-    PciHeaderType, PciMassStorageSubclass, PciNetworkControllerSubclass, PciSubclass,
+    BarReprogrammingParams, MaybeMutInterruptSourceGroup, MsixCap, MsixConfig, PciBarConfiguration,
+    PciBarRegionType, PciCapability, PciCapabilityId, PciClassCode, PciConfiguration, PciDevice,
+    PciDeviceError, PciHeaderType, PciMassStorageSubclass, PciNetworkControllerSubclass,
+    PciSubclass,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -44,7 +45,7 @@ use crate::{
 };
 
 /// Vector value used to disable MSI for a queue.
-const VIRTQ_MSI_NO_VECTOR: u16 = 0xffff;
+pub(super) const VIRTQ_MSI_NO_VECTOR: u16 = 0xffff;
 
 enum PciCapabilityType {
     Common = 1,
@@ -231,28 +232,46 @@ impl PciSubclass for PciVirtioSubclass {
     }
 }
 
+/// Max number of virtio queues Cloud Hypervisor supports.
+/// This is set by the current size of the notification BAR.
+const MAX_QUEUES: u64 = 0x400;
+
+// Automatically compute the position of the next entry in the BAR.
+// This handles alignment properly and is much less error-prone than
+// manual calculation.
+const fn next_bar_addr_align(offset: u64, size: u64, align: u64) -> u64 {
+    assert!(align >= 0x2000, "too small alignment for structure in BAR");
+    assert!(align.is_power_of_two(), "alignment must be a power of 2");
+    (offset + size).next_multiple_of(align)
+}
+// Same as next_bar_addr_align(), but with the default alignment (8K).
+const fn next_bar_addr(offset: u64, size: u64) -> u64 {
+    next_bar_addr_align(offset, size, 0x2000)
+}
+
 // Allocate one bar for the structs pointed to by the capability structures.
 // As per the PCI specification, because the same BAR shares MSI-X and non
 // MSI-X structures, it is recommended to use 8KiB alignment for all those
 // structures.
 const COMMON_CONFIG_BAR_OFFSET: u64 = 0x0000;
 const COMMON_CONFIG_SIZE: u64 = 56;
-const ISR_CONFIG_BAR_OFFSET: u64 = 0x2000;
+const ISR_CONFIG_BAR_OFFSET: u64 = next_bar_addr(COMMON_CONFIG_BAR_OFFSET, COMMON_CONFIG_SIZE);
 const ISR_CONFIG_SIZE: u64 = 1;
-const DEVICE_CONFIG_BAR_OFFSET: u64 = 0x4000;
+const DEVICE_CONFIG_BAR_OFFSET: u64 = next_bar_addr(ISR_CONFIG_BAR_OFFSET, ISR_CONFIG_SIZE);
 const DEVICE_CONFIG_SIZE: u64 = 0x1000;
-const NOTIFICATION_BAR_OFFSET: u64 = 0x6000;
-const NOTIFICATION_SIZE: u64 = 0x1000;
-const MSIX_TABLE_BAR_OFFSET: u64 = 0x8000;
+const NOTIFICATION_BAR_OFFSET: u64 = next_bar_addr(DEVICE_CONFIG_BAR_OFFSET, DEVICE_CONFIG_SIZE);
+const NOTIFICATION_SIZE: u64 = MAX_QUEUES * NOTIFY_OFF_MULTIPLIER as u64;
+const MSIX_TABLE_BAR_OFFSET: u64 = next_bar_addr(NOTIFICATION_BAR_OFFSET, NOTIFICATION_SIZE);
+
 // The size is 256KiB because the table can hold up to 2048 entries, with each
 // entry being 128 bits (4 DWORDS).
 const MSIX_TABLE_SIZE: u64 = 0x40000;
-const MSIX_PBA_BAR_OFFSET: u64 = 0x48000;
+const MSIX_PBA_BAR_OFFSET: u64 = next_bar_addr(MSIX_TABLE_BAR_OFFSET, MSIX_TABLE_SIZE);
 // The size is 2KiB because the Pending Bit Array has one bit per vector and it
 // can support up to 2048 vectors.
 const MSIX_PBA_SIZE: u64 = 0x800;
 // The BAR size must be a power of 2.
-const CAPABILITY_BAR_SIZE: u64 = 0x80000;
+const CAPABILITY_BAR_SIZE: u64 = (MSIX_PBA_BAR_OFFSET + MSIX_PBA_SIZE).next_power_of_two();
 const VIRTIO_COMMON_BAR_INDEX: usize = 0;
 const VIRTIO_SHM_BAR_INDEX: usize = 2;
 
@@ -288,15 +307,18 @@ pub struct VirtioPciDeviceActivator {
     queues: Option<Vec<(usize, Queue, EventFd)>>,
     barrier: Option<Arc<Barrier>>,
     id: String,
+    status: Arc<AtomicU8>,
 }
 
 impl VirtioPciDeviceActivator {
-    pub fn activate(&mut self) -> ActivateResult {
-        self.device.lock().unwrap().activate(
-            self.memory.take().unwrap(),
-            self.interrupt.take().unwrap(),
-            self.queues.take().unwrap(),
-        )?;
+    pub fn activate(mut self) -> ActivateResult {
+        let mut locked_device = self.device.lock().unwrap();
+        locked_device.activate(crate::device::ActivationContext {
+            mem: self.memory.take().unwrap(),
+            interrupt_cb: self.interrupt.take().unwrap(),
+            queues: self.queues.take().unwrap(),
+            device_status: self.status,
+        })?;
         self.device_activated.store(true, Ordering::SeqCst);
 
         if let Some(barrier) = self.barrier.take() {
@@ -338,7 +360,7 @@ pub struct VirtioPciDevice {
     // PCI interrupts.
     interrupt_status: Arc<AtomicUsize>,
     virtio_interrupt: Option<Arc<dyn VirtioInterrupt>>,
-    interrupt_source_group: Arc<dyn InterruptSourceGroup>,
+    interrupt_source_group: MaybeMutInterruptSourceGroup,
 
     // virtio queues
     queues: Vec<Queue>,
@@ -412,17 +434,26 @@ impl VirtioPciDevice {
 
         let pci_device_id = VIRTIO_PCI_DEVICE_ID_BASE + locked_device.device_type() as u16;
 
-        let interrupt_source_group = interrupt_manager
-            .create_group(MsiIrqGroupConfig {
+        let interrupt_source_group: MaybeMutInterruptSourceGroup = {
+            let config = MsiIrqGroupConfig {
                 base: 0,
                 count: msix_num as InterruptIndex,
+            };
+            (if locked_device.interrupt_source_mutable() {
+                interrupt_manager
+                    .create_group_mut(config)
+                    .map(MaybeMutInterruptSourceGroup::Mutable)
+            } else {
+                interrupt_manager
+                    .create_group(config)
+                    .map(MaybeMutInterruptSourceGroup::Immutable)
             })
             .map_err(|e| {
                 VirtioPciDeviceError::CreateVirtioPciDevice(anyhow!(
                     "Failed creating MSI interrupt group: {e}"
                 ))
-            })?;
-
+            })?
+        };
         let msix_state =
             vm_migration::state_from_id(snapshot, pci::MSIX_CONFIG_ID).map_err(|e| {
                 VirtioPciDeviceError::CreateVirtioPciDevice(anyhow!(
@@ -431,14 +462,11 @@ impl VirtioPciDevice {
             })?;
 
         let (msix_config, msix_config_clone) = if msix_num > 0 {
+            let interrupt_source_group: MaybeMutInterruptSourceGroup =
+                interrupt_source_group.clone();
             let msix_config = Arc::new(Mutex::new(
-                MsixConfig::new(
-                    msix_num,
-                    interrupt_source_group.clone(),
-                    pci_device_bdf,
-                    msix_state,
-                )
-                .unwrap(),
+                MsixConfig::new(msix_num, interrupt_source_group, pci_device_bdf, msix_state)
+                    .unwrap(),
             ));
             let msix_config_clone = msix_config.clone();
             (Some(msix_config), Some(msix_config_clone))
@@ -577,7 +605,7 @@ impl VirtioPciDevice {
             memory,
             settings_bar: 0,
             use_64bit_bar,
-            interrupt_source_group,
+            interrupt_source_group: interrupt_source_group.clone(),
             cap_pci_cfg_info,
             bar_regions: vec![],
             activate_evt,
@@ -641,13 +669,13 @@ impl VirtioPciDevice {
     fn is_driver_ready(&self) -> bool {
         let ready_bits =
             (DEVICE_ACKNOWLEDGE | DEVICE_DRIVER | DEVICE_DRIVER_OK | DEVICE_FEATURES_OK) as u8;
-        self.common_config.driver_status == ready_bits
-            && self.common_config.driver_status & DEVICE_FAILED as u8 == 0
+        let driver_status = self.common_config.driver_status.load(Ordering::SeqCst);
+        driver_status == ready_bits && (driver_status & DEVICE_FAILED as u8) == 0
     }
 
     /// Determines if the driver has requested the device (re)init / reset itself
     fn is_driver_init(&self) -> bool {
-        self.common_config.driver_status == DEVICE_INIT as u8
+        self.common_config.driver_status.load(Ordering::SeqCst) == DEVICE_INIT as u8
     }
 
     pub fn config_bar_addr(&self) -> u64 {
@@ -801,6 +829,7 @@ impl VirtioPciDevice {
             device_activated: self.device_activated.clone(),
             barrier,
             id: self.id.clone(),
+            status: self.common_config.driver_status.clone(),
         }
     }
 
@@ -833,7 +862,7 @@ pub struct VirtioInterruptMsix {
     msix_config: Arc<Mutex<MsixConfig>>,
     config_vector: Arc<AtomicU16>,
     queues_vectors: Arc<Mutex<Vec<u16>>>,
-    interrupt_source_group: Arc<dyn InterruptSourceGroup>,
+    interrupt_source_group: MaybeMutInterruptSourceGroup,
 }
 
 impl VirtioInterruptMsix {
@@ -841,7 +870,7 @@ impl VirtioInterruptMsix {
         msix_config: Arc<Mutex<MsixConfig>>,
         config_vector: Arc<AtomicU16>,
         queues_vectors: Arc<Mutex<Vec<u16>>>,
-        interrupt_source_group: Arc<dyn InterruptSourceGroup>,
+        interrupt_source_group: MaybeMutInterruptSourceGroup,
     ) -> Self {
         VirtioInterruptMsix {
             msix_config,
@@ -892,6 +921,16 @@ impl VirtioInterrupt for VirtioInterruptMsix {
         self.interrupt_source_group
             .notifier(vector as InterruptIndex)
     }
+
+    fn set_notifier(
+        &self,
+        interrupt: u32,
+        eventfd: Option<EventFd>,
+        vm: &dyn hypervisor::Vm,
+    ) -> std::io::Result<()> {
+        self.interrupt_source_group
+            .set_notifier(interrupt, eventfd, vm)
+    }
 }
 
 impl PciDevice for VirtioPciDevice {
@@ -939,7 +978,7 @@ impl PciDevice for VirtioPciDevice {
 
     fn allocate_bars(
         &mut self,
-        _allocator: &Arc<Mutex<SystemAllocator>>,
+        _allocator: &mut SystemAllocator,
         mmio32_allocator: &mut AddressAllocator,
         mmio64_allocator: &mut AddressAllocator,
         resources: Option<Vec<Resource>>,
@@ -1140,6 +1179,7 @@ impl PciDevice for VirtioPciDevice {
     }
 
     fn write_bar(&mut self, _base: u64, offset: u64, data: &[u8]) -> Option<Arc<Barrier>> {
+        let initial_ready = self.is_driver_ready();
         match offset {
             o if o < COMMON_CONFIG_BAR_OFFSET + COMMON_CONFIG_SIZE => self.common_config.write(
                 o - COMMON_CONFIG_BAR_OFFSET,
@@ -1191,8 +1231,8 @@ impl PciDevice for VirtioPciDevice {
             _ => (),
         }
 
-        // Try and activate the device if the driver status has changed
-        if self.needs_activation() {
+        // Try and activate the device if the driver status has changed (from unready to ready)
+        if !initial_ready && self.needs_activation() {
             let barrier = Arc::new(Barrier::new(2));
             let activator = self.prepare_activator(Some(barrier.clone()));
             self.pending_activations.lock().unwrap().push(activator);
@@ -1219,7 +1259,9 @@ impl PciDevice for VirtioPciDevice {
                 self.common_config.queue_select = 0;
             } else {
                 error!("Attempt to reset device when not implemented in underlying device");
-                self.common_config.driver_status = crate::DEVICE_FAILED as u8;
+                self.common_config
+                    .driver_status
+                    .store(crate::DEVICE_FAILED as u8, Ordering::SeqCst);
             }
         }
 

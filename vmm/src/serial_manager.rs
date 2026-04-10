@@ -6,6 +6,7 @@
 use std::fs::File;
 use std::io::Read;
 use std::net::Shutdown;
+use std::os::fd::OwnedFd;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::net::UnixStream;
 use std::panic::AssertUnwindSafe;
@@ -24,7 +25,7 @@ use serial_buffer::SerialBuffer;
 use thiserror::Error;
 use vmm_sys_util::eventfd::EventFd;
 
-use crate::console_devices::ConsoleOutput;
+use crate::console_devices::ConsoleTransport;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -113,8 +114,8 @@ pub struct SerialManager {
     serial: Arc<Mutex<Serial>>,
     #[cfg(target_arch = "aarch64")]
     serial: Arc<Mutex<Pl011>>,
-    epoll_file: File,
-    in_file: ConsoleOutput,
+    epoll_fd: OwnedFd,
+    transport: ConsoleTransport,
     kill_evt: EventFd,
     handle: Option<thread::JoinHandle<()>>,
     pty_write_out: Option<Arc<AtomicBool>>,
@@ -125,50 +126,9 @@ impl SerialManager {
     pub fn new(
         #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))] serial: Arc<Mutex<Serial>>,
         #[cfg(target_arch = "aarch64")] serial: Arc<Mutex<Pl011>>,
-        mut output: ConsoleOutput,
+        mut transport: ConsoleTransport,
         socket: Option<PathBuf>,
     ) -> Result<Option<Self>> {
-        let mut socket_path: Option<PathBuf> = None;
-
-        let in_fd = match output {
-            ConsoleOutput::Pty(ref fd) => fd.as_raw_fd(),
-            ConsoleOutput::Tty(_) => {
-                // If running on an interactive TTY then accept input
-                // SAFETY: trivially safe
-                if unsafe { libc::isatty(libc::STDIN_FILENO) == 1 } {
-                    // SAFETY: STDIN_FILENO is a valid fd
-                    let fd = unsafe { libc::dup(libc::STDIN_FILENO) };
-                    if fd == -1 {
-                        return Err(Error::DupFd(std::io::Error::last_os_error()));
-                    }
-                    // SAFETY: fd is valid and owned by us
-                    let stdin_clone = unsafe { File::from_raw_fd(fd) };
-                    // SAFETY: FFI calls with correct arguments
-                    let ret = unsafe {
-                        let mut flags = libc::fcntl(stdin_clone.as_raw_fd(), libc::F_GETFL);
-                        flags |= libc::O_NONBLOCK;
-                        libc::fcntl(stdin_clone.as_raw_fd(), libc::F_SETFL, flags)
-                    };
-
-                    if ret < 0 {
-                        return Err(Error::SetNonBlocking(std::io::Error::last_os_error()));
-                    }
-
-                    output = ConsoleOutput::Tty(Arc::new(stdin_clone));
-                    fd
-                } else {
-                    return Ok(None);
-                }
-            }
-            ConsoleOutput::Socket(ref fd) => {
-                if let Some(path_in_socket) = socket {
-                    socket_path = Some(path_in_socket.clone());
-                }
-                fd.as_raw_fd()
-            }
-            _ => return Ok(None),
-        };
-
         let epoll_fd = epoll::create(true).map_err(Error::Epoll)?;
         let kill_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::EventFd)?;
 
@@ -180,7 +140,49 @@ impl SerialManager {
         )
         .map_err(Error::Epoll)?;
 
-        let epoll_fd_data = if let ConsoleOutput::Socket(_) = output {
+        let mut socket_path: Option<PathBuf> = None;
+
+        let in_fd = match transport {
+            ConsoleTransport::Pty(ref fd) => fd.as_raw_fd(),
+            ConsoleTransport::Tty(_)
+                // If running on an interactive TTY then accept input
+                // SAFETY: trivially safe
+                if unsafe { libc::isatty(libc::STDIN_FILENO) == 1 } =>
+            {
+                // SAFETY: STDIN_FILENO is a valid fd
+                let fd = unsafe { libc::dup(libc::STDIN_FILENO) };
+                if fd == -1 {
+                    return Err(Error::DupFd(std::io::Error::last_os_error()));
+                }
+                // SAFETY: fd is valid and owned by us
+                let stdin_clone = unsafe { File::from_raw_fd(fd) };
+                // SAFETY: FFI calls with correct arguments
+                let ret = unsafe {
+                    let mut flags = libc::fcntl(stdin_clone.as_raw_fd(), libc::F_GETFL);
+                    flags |= libc::O_NONBLOCK;
+                    libc::fcntl(stdin_clone.as_raw_fd(), libc::F_SETFL, flags)
+                };
+
+                if ret < 0 {
+                    return Err(Error::SetNonBlocking(std::io::Error::last_os_error()));
+                }
+
+                transport = ConsoleTransport::Tty(Arc::new(stdin_clone));
+                fd
+            }
+            ConsoleTransport::Tty(_) => {
+                return Ok(None);
+            }
+            ConsoleTransport::Socket(ref listener) => {
+                if let Some(path_in_socket) = socket {
+                    socket_path = Some(path_in_socket.clone());
+                }
+                listener.as_raw_fd()
+            }
+            _ => return Ok(None),
+        };
+
+        let in_event = if let ConsoleTransport::Socket(_) = transport {
             EpollDispatch::Socket
         } else {
             EpollDispatch::File
@@ -190,12 +192,12 @@ impl SerialManager {
             epoll_fd,
             epoll::ControlOptions::EPOLL_CTL_ADD,
             in_fd,
-            epoll::Event::new(epoll::Events::EPOLLIN, epoll_fd_data as u64),
+            epoll::Event::new(epoll::Events::EPOLLIN, in_event as u64),
         )
         .map_err(Error::Epoll)?;
 
         let mut pty_write_out = None;
-        if let ConsoleOutput::Pty(ref file) = output {
+        if let ConsoleTransport::Pty(ref file) = transport {
             let write_out = Arc::new(AtomicBool::new(false));
             pty_write_out = Some(write_out.clone());
             let writer = file.try_clone().map_err(Error::FileClone)?;
@@ -207,14 +209,14 @@ impl SerialManager {
                 .set_out(Some(Box::new(buffer)));
         }
 
-        // Use 'File' to enforce closing on 'epoll_fd'
+        // Use 'OwnedFd' to manage lifetime
         // SAFETY: epoll_fd is valid
-        let epoll_file = unsafe { File::from_raw_fd(epoll_fd) };
+        let epoll_fd = unsafe { OwnedFd::from_raw_fd(epoll_fd) };
 
         Ok(Some(SerialManager {
             serial,
-            epoll_file,
-            in_file: output,
+            epoll_fd,
+            transport,
             kill_evt,
             handle: None,
             pty_write_out,
@@ -255,8 +257,8 @@ impl SerialManager {
             return Ok(());
         }
 
-        let epoll_fd = self.epoll_file.as_raw_fd();
-        let in_file = self.in_file.clone();
+        let epoll_fd = self.epoll_fd.try_clone().map_err(Error::Epoll)?;
+        let transport = self.transport.clone();
         let serial = self.serial.clone();
         let pty_write_out = self.pty_write_out.clone();
         let mut reader: Option<UnixStream> = None;
@@ -277,24 +279,25 @@ impl SerialManager {
                         [epoll::Event::new(epoll::Events::empty(), 0); EPOLL_EVENTS_LEN];
 
                     loop {
-                        let num_events = match epoll::wait(epoll_fd, timeout, &mut events[..]) {
-                            Ok(res) => res,
-                            Err(e) => {
-                                if e.kind() == io::ErrorKind::Interrupted {
-                                    // It's well defined from the epoll_wait() syscall
-                                    // documentation that the epoll loop can be interrupted
-                                    // before any of the requested events occurred or the
-                                    // timeout expired. In both those cases, epoll_wait()
-                                    // returns an error of type EINTR, but this should not
-                                    // be considered as a regular error. Instead it is more
-                                    // appropriate to retry, by calling into epoll_wait().
-                                    continue;
+                        let num_events =
+                            match epoll::wait(epoll_fd.as_raw_fd(), timeout, &mut events[..]) {
+                                Ok(res) => res,
+                                Err(e) => {
+                                    if e.kind() == io::ErrorKind::Interrupted {
+                                        // It's well defined from the epoll_wait() syscall
+                                        // documentation that the epoll loop can be interrupted
+                                        // before any of the requested events occurred or the
+                                        // timeout expired. In both those cases, epoll_wait()
+                                        // returns an error of type EINTR, but this should not
+                                        // be considered as a regular error. Instead it is more
+                                        // appropriate to retry, by calling into epoll_wait().
+                                        continue;
+                                    }
+                                    return Err(Error::Epoll(e));
                                 }
-                                return Err(Error::Epoll(e));
-                            }
-                        };
+                            };
 
-                        if matches!(in_file, ConsoleOutput::Pty(_)) && num_events == 0 {
+                        if matches!(transport, ConsoleTransport::Pty(_)) && num_events == 0 {
                             // This very specific case happens when the serial is connected
                             // to a PTY. We know EPOLLHUP is always present when there's nothing
                             // connected at the other end of the PTY. That's why getting no event
@@ -319,7 +322,7 @@ impl SerialManager {
                                             .map_err(Error::AcceptConnection)?;
                                     }
 
-                                    let ConsoleOutput::Socket(ref listener) = in_file else {
+                                    let ConsoleTransport::Socket(ref listener) = transport else {
                                         unreachable!();
                                     };
 
@@ -331,7 +334,7 @@ impl SerialManager {
                                         unix_stream.try_clone().map_err(Error::CloneUnixStream)?;
 
                                     epoll::ctl(
-                                        epoll_fd,
+                                        epoll_fd.as_raw_fd(),
                                         epoll::ControlOptions::EPOLL_CTL_ADD,
                                         unix_stream.as_raw_fd(),
                                         epoll::Event::new(
@@ -347,8 +350,8 @@ impl SerialManager {
                                 EpollDispatch::File => {
                                     if event.events & libc::EPOLLIN as u32 != 0 {
                                         let mut input = [0u8; 64];
-                                        let count = match &in_file {
-                                            ConsoleOutput::Socket(_) => {
+                                        let count = match &transport {
+                                            ConsoleTransport::Socket(_) => {
                                                 if let Some(mut serial_reader) = reader.as_ref() {
                                                     let count = serial_reader
                                                         .read(&mut input)
@@ -370,11 +373,10 @@ impl SerialManager {
                                                     0
                                                 }
                                             }
-                                            ConsoleOutput::Pty(file) | ConsoleOutput::Tty(file) => {
-                                                (&**file)
-                                                    .read(&mut input)
-                                                    .map_err(Error::ReadInput)?
-                                            }
+                                            ConsoleTransport::Pty(file)
+                                            | ConsoleTransport::Tty(file) => (&**file)
+                                                .read(&mut input)
+                                                .map_err(Error::ReadInput)?,
                                             _ => unreachable!(),
                                         };
 
@@ -431,7 +433,7 @@ impl Drop for SerialManager {
         if let Some(handle) = self.handle.take() {
             handle.join().ok();
         }
-        if let ConsoleOutput::Socket(_) = self.in_file
+        if let ConsoleTransport::Socket(_) = self.transport
             && let Some(socket_path) = self.socket_path.as_ref()
         {
             std::fs::remove_file(socket_path.as_os_str())

@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::result;
 use std::str::FromStr;
 
+use block::ImageType;
 use clap::ArgMatches;
 use log::{debug, warn};
 use option_parser::{
@@ -18,6 +19,7 @@ use option_parser::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use virtio_bindings::virtio_blk::VIRTIO_BLK_ID_BYTES;
+use virtio_bindings::virtio_ids::*;
 use virtio_devices::block::MINIMUM_BLOCK_QUEUE_SIZE;
 use virtio_devices::vhost_user::VIRTIO_FS_TAG_LEN;
 use virtio_devices::{RateLimiterConfig, TokenBucketConfig};
@@ -45,6 +47,34 @@ pub enum Error {
     /// Filesystem socket is missing
     #[error("Error parsing --fs: socket missing")]
     ParseFsSockMissing,
+    /// Generic vhost-user virtio ID is invalid
+    #[error(
+        "Error parsing --generic-vhost-user: virtio ID {0:?} invalid (leading zeros or unknown string)"
+    )]
+    ParseGenericVhostUserVirtioIdInvalid(String),
+    /// Generic vhost-user virtio ID is unsupported
+    #[error(
+        "Error parsing --generic-vhost-user: device with virtio ID {0:?} cannot be implemented via vhost-user"
+    )]
+    ParseGenericVhostUserVirtioIdUnsupported(String),
+    /// Generic vhost-user socket is missing
+    #[error("Error parsing --generic-vhost-user: socket missing")]
+    ParseGenericVhostUserSockMissing,
+    /// Generic vhost-user number of queues is missing
+    #[error("Error parsing --generic-vhost-user: number of queues missing")]
+    ParseGenericVhostUserNumResponseQueuesMissing,
+    /// Generic vhost-user virtio ID is missing
+    #[error("Error parsing --generic-vhost-user: virtio ID missing")]
+    ParseGenericVhostUserVirtioIdMissing,
+    /// Generic vhost-user available features is missing
+    #[error("Error parsing --generic-vhost-user: available features missing")]
+    ParseGenericVhostUserAvailFeaturesMissing,
+    /// Generic vhost-user queue size is too large
+    #[error("Error parsing --generic-vhost-user: queue size {0} is {1}, but limit is 65535")]
+    ParseGenericVhostUserQueueSizeTooLarge(usize, u64),
+    /// Generic vhost-user queue size missing
+    #[error("Error parsing --generic-vhost-user: queue size missing")]
+    ParseGenericVhostUserQueueSizeMissing,
     /// Missing persistent memory file parameter.
     #[error("Error parsing --pmem: file missing")]
     ParsePmemFileMissing,
@@ -93,6 +123,9 @@ pub enum Error {
     /// Error parsing persistent memory parameters
     #[error("Error parsing --pmem")]
     ParsePersistentMemory(#[source] OptionParserError),
+    /// Error parsing generic vhost-user parameters
+    #[error("Error parsing --generic-vhost-user")]
+    ParseGenericVhostUser(#[source] OptionParserError),
     /// Failed parsing console
     #[error("Error parsing --console")]
     ParseConsole(#[source] OptionParserError),
@@ -186,8 +219,8 @@ pub enum ValidationError {
     #[error("Path missing when using socket console mode")]
     ConsoleSocketPathMissing,
     /// Max is less than boot
-    #[error("Max CPUs lower than boot CPUs")]
-    CpusMaxLowerThanBoot,
+    #[error("Max CPUs ({0}) lower than boot CPUs ({1})")]
+    CpusMaxLowerThanBoot(u32 /* max vCPUs */, u32 /* boot vCPUs */),
     /// Too many CPUs.
     #[error("Too many CPUs: specified {0} but {MAX_SUPPORTED_CPUS} is the limit")]
     TooManyCpus(u32 /* specified CPUs */),
@@ -221,14 +254,14 @@ pub enum ValidationError {
     #[error("Dies per package must be 1")]
     CpuTopologyDiesPerPackage,
     /// Virtio needs a min of 2 queues
-    #[error("Number of queues to virtio_net less than 2")]
-    VnetQueueLowerThan2,
+    #[error("Number of queues ({0}) to virtio_net should be higher than 2")]
+    VnetQueueLowerThan2(usize),
     /// The input queue number for virtio_net must match the number of input fds
-    #[error("Number of queues to virtio_net does not match the number of input FDs")]
-    VnetQueueFdMismatch,
+    #[error("Number of queues ({0}) to virtio_net does not match the number of FDs ({1})")]
+    VnetQueueFdMismatch(usize /* num of queues */, usize /* FD num */),
     /// Using reserved fd
-    #[error("Reserved fd number (<= 2)")]
-    VnetReservedFd,
+    #[error("Reserved fd number (<= 2): {0}")]
+    VnetReservedFd(i32),
     /// Hardware checksum offload is disabled.
     #[error("\"offload_tso\" and \"offload_ufo\" depend on \"offload_csum\"")]
     NoHardwareChecksumOffload,
@@ -247,8 +280,8 @@ pub enum ValidationError {
     #[error("No TDX firmware specified")]
     TdxFirmwareMissing,
     /// Insufficient vCPUs for queues
-    #[error("Number of vCPUs is insufficient for number of queues")]
-    TooManyQueues,
+    #[error("Queue count ({0}) must not exceed boot vCPUs ({1})")]
+    TooManyQueues(usize /* queues */, usize /* vCPUs */),
     /// Invalid queue size
     #[error("Queue size is smaller than {MINIMUM_BLOCK_QUEUE_SIZE}: {0}")]
     InvalidQueueSize(u16),
@@ -323,6 +356,9 @@ pub enum ValidationError {
     /// Number of FDs passed during Restore are incorrect to the NetConfig
     #[error("Number of Net FDs passed for '{0}' during Restore: {1}. Expected: {2}")]
     RestoreNetFdCountMismatch(String, usize, usize),
+    /// Prefault cannot be combined with on-demand restore
+    #[error("'prefault' cannot be combined with 'memory_restore_mode=ondemand'")]
+    InvalidRestorePrefaultWithOnDemand,
     /// Path provided in landlock-rules doesn't exist
     #[error("Path {0:?} provided in landlock-rules does not exist")]
     LandlockPathDoesNotExist(PathBuf),
@@ -362,6 +398,9 @@ pub enum ValidationError {
     MaskProvidedWithoutIp,
     #[error("IP provided without a mask")]
     IpProvidedWithoutMask,
+    /// Invalid NUMA Configuration
+    #[error("NUMA Configuration is invalid")]
+    InvalidNumaConfig(String),
 }
 
 type ValidationResult<T> = std::result::Result<T, ValidationError>;
@@ -390,6 +429,7 @@ pub struct VmParams<'a> {
     pub rng: &'a str,
     pub balloon: Option<&'a str>,
     pub fs: Option<Vec<&'a str>>,
+    pub generic_vhost_user: Option<Vec<&'a str>>,
     pub pmem: Option<Vec<&'a str>>,
     pub serial: &'a str,
     pub console: &'a str,
@@ -451,6 +491,9 @@ impl<'a> VmParams<'a> {
         let fs: Option<Vec<&str>> = args
             .get_many::<String>("fs")
             .map(|x| x.map(|y| y as &str).collect());
+        let generic_vhost_user: Option<Vec<&str>> = args
+            .get_many::<String>("generic-vhost-user")
+            .map(|x| x.map(|y| y as &str).collect());
         let pmem: Option<Vec<&str>> = args
             .get_many::<String>("pmem")
             .map(|x| x.map(|y| y as &str).collect());
@@ -505,6 +548,7 @@ impl<'a> VmParams<'a> {
             rng,
             balloon,
             fs,
+            generic_vhost_user,
             pmem,
             serial,
             console,
@@ -555,6 +599,23 @@ impl FromStr for HotplugMethod {
     }
 }
 
+pub enum ParseCoreSchedulingError {
+    InvalidValue(String),
+}
+
+impl FromStr for CoreScheduling {
+    type Err = ParseCoreSchedulingError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "vm" => Ok(CoreScheduling::Vm),
+            "vcpu" => Ok(CoreScheduling::Vcpu),
+            "off" => Ok(CoreScheduling::Off),
+            _ => Err(ParseCoreSchedulingError::InvalidValue(s.to_owned())),
+        }
+    }
+}
+
 pub enum CpuTopologyParseError {
     InvalidValue(String),
 }
@@ -599,7 +660,8 @@ impl CpusConfig {
             .add("max_phys_bits")
             .add("affinity")
             .add("features")
-            .add("nested");
+            .add("nested")
+            .add("core_scheduling");
         parser.parse(cpus).map_err(Error::ParseCpus)?;
 
         let boot_vcpus: u32 = parser
@@ -658,14 +720,11 @@ impl CpusConfig {
             .map_err(Error::ParseCpus)?
             .is_none_or(|toggle| toggle.0);
 
-        // Nested virtualization is always turned on for aarch64 and riscv64
-        // TODO: revisit this when nested support can be turned of on these architectures
-        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-        if !nested {
-            return Err(Error::ParseCpus(OptionParserError::InvalidValue(
-                "nested=off is not supported on aarch64 and riscv64 architectures".to_string(),
-            )));
-        }
+        let core_scheduling = parser
+            .convert("core_scheduling")
+            .map_err(Error::ParseCpus)?
+            .unwrap_or(CoreScheduling::Vm);
+
         Ok(CpusConfig {
             boot_vcpus,
             max_vcpus,
@@ -675,6 +734,7 @@ impl CpusConfig {
             affinity,
             features,
             nested,
+            core_scheduling,
         })
     }
 }
@@ -979,21 +1039,24 @@ impl MemoryConfig {
     }
 
     pub fn total_size(&self) -> u64 {
-        let mut size = self.size;
-        if let Some(hotplugged_size) = self.hotplugged_size {
-            size += hotplugged_size;
-        }
+        self.size
+            + self
+                .zones
+                .iter()
+                .flatten()
+                .map(|zone| zone.size)
+                .sum::<u64>()
+            + self.hotplugged_size()
+    }
 
-        if let Some(zones) = &self.zones {
-            for zone in zones.iter() {
-                size += zone.size;
-                if let Some(hotplugged_size) = zone.hotplugged_size {
-                    size += hotplugged_size;
-                }
-            }
-        }
-
-        size
+    pub fn hotplugged_size(&self) -> u64 {
+        self.hotplugged_size.unwrap_or(0)
+            + self
+                .zones
+                .iter()
+                .flatten()
+                .filter_map(|zone| zone.hotplugged_size)
+                .sum::<u64>()
     }
 }
 
@@ -1093,7 +1156,8 @@ impl DiskConfig {
          ops_size=<io_ops>,ops_one_time_burst=<io_ops>,ops_refill_time=<ms>,\
          id=<device_id>,pci_segment=<segment_id>,rate_limit_group=<group_id>,\
          queue_affinity=<list_of_queue_indices_with_their_associated_cpuset>,\
-         serial=<serial_number>";
+         serial=<serial_number>,backing_files=on|off,sparse=on|off,\
+         image_type=<raw,qcow2,vhd,vhdx>,lock_granularity=byte-range|full";
 
     pub fn parse(disk: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
@@ -1118,7 +1182,12 @@ impl DiskConfig {
             .add("pci_segment")
             .add("serial")
             .add("rate_limit_group")
-            .add("queue_affinity");
+            .add("queue_affinity")
+            .add("backing_files")
+            .add("sparse")
+            .add("image_type")
+            .add("lock_granularity");
+
         parser.parse(disk).map_err(Error::ParseDisk)?;
 
         let path = parser.get("path").map(PathBuf::from);
@@ -1203,6 +1272,27 @@ impl DiskConfig {
                     })
                     .collect()
             });
+
+        let backing_files = parser
+            .convert::<Toggle>("backing_files")
+            .map_err(Error::ParseDisk)?
+            .unwrap_or(Toggle(false))
+            .0;
+
+        let image_type = if vhost_socket.is_none() {
+            parser
+                .convert::<ImageType>("image_type")
+                .map_err(Error::ParseDisk)?
+                .unwrap_or(ImageType::Unknown)
+        } else {
+            ImageType::Unknown
+        };
+
+        let lock_granularity = parser
+            .convert::<LockGranularityChoice>("lock_granularity")
+            .map_err(Error::ParseDisk)?
+            .unwrap_or_default();
+
         let bw_tb_config = if bw_size != 0 && bw_refill_time != 0 {
             Some(TokenBucketConfig {
                 size: bw_size,
@@ -1229,6 +1319,11 @@ impl DiskConfig {
         } else {
             None
         };
+        let sparse = parser
+            .convert::<Toggle>("sparse")
+            .map_err(Error::ParseDisk)?
+            .unwrap_or_else(|| Toggle(default_diskconfig_sparse()))
+            .0;
 
         Ok(DiskConfig {
             path,
@@ -1247,12 +1342,19 @@ impl DiskConfig {
             pci_segment,
             serial,
             queue_affinity,
+            backing_files,
+            sparse,
+            image_type,
+            lock_granularity,
         })
     }
 
     pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
         if self.num_queues > vm_config.cpus.boot_vcpus as usize {
-            return Err(ValidationError::TooManyQueues);
+            return Err(ValidationError::TooManyQueues(
+                self.num_queues,
+                vm_config.cpus.boot_vcpus as usize,
+            ));
         }
 
         if self.queue_size <= MINIMUM_BLOCK_QUEUE_SIZE {
@@ -1313,11 +1415,11 @@ impl FromStr for VhostMode {
 
 impl NetConfig {
     pub const SYNTAX: &'static str = "Network parameters \
-    \"tap=<if_name>,ip=<ip_addr>,mask=<net_mask>,mac=<mac_addr>,fd=<fd1,fd2...>,iommu=on|off,\
+    \"tap=<if_name>,ip=<ip_addr>,mask=<net_mask>,mac=<mac_addr>,fd=<[fd1,fd2,...]>,iommu=on|off,\
     num_queues=<number_of_queues>,queue_size=<size_of_each_queue>,id=<device_id>,\
     vhost_user=<vhost_user_enable>,socket=<vhost_user_socket_path>,vhost_mode=client|server,\
     bw_size=<bytes>,bw_one_time_burst=<bytes>,bw_refill_time=<ms>,\
-    ops_size=<io_ops>,ops_one_time_burst=<io_ops>,ops_refill_time=<ms>,pci_segment=<segment_id>\
+    ops_size=<io_ops>,ops_one_time_burst=<io_ops>,ops_refill_time=<ms>,pci_segment=<segment_id>,\
     offload_tso=on|off,offload_ufo=on|off,offload_csum=on|off\"";
 
     pub fn parse(net: &str) -> Result<Self> {
@@ -1484,23 +1586,30 @@ impl NetConfig {
 
     pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
         if self.num_queues < 2 {
-            return Err(ValidationError::VnetQueueLowerThan2);
+            return Err(ValidationError::VnetQueueLowerThan2(self.num_queues));
         }
 
-        if self.fds.is_some() && self.fds.as_ref().unwrap().len() * 2 != self.num_queues {
-            return Err(ValidationError::VnetQueueFdMismatch);
-        }
+        if let Some(fds) = &self.fds {
+            let actual_queues = fds.len() * 2;
+            if actual_queues != self.num_queues {
+                return Err(ValidationError::VnetQueueFdMismatch(
+                    self.num_queues,
+                    actual_queues,
+                ));
+            }
 
-        if let Some(fds) = self.fds.as_ref() {
-            for fd in fds {
-                if *fd <= 2 {
-                    return Err(ValidationError::VnetReservedFd);
+            for &fd in fds {
+                if fd <= 2 {
+                    return Err(ValidationError::VnetReservedFd(fd));
                 }
             }
         }
 
         if (self.num_queues / 2) > vm_config.cpus.boot_vcpus as usize {
-            return Err(ValidationError::TooManyQueues);
+            return Err(ValidationError::TooManyQueues(
+                self.num_queues,
+                vm_config.cpus.boot_vcpus as usize,
+            ));
         }
 
         if self.vhost_user && self.iommu {
@@ -1599,6 +1708,148 @@ impl BalloonConfig {
     }
 }
 
+impl GenericVhostUserConfig {
+    pub const SYNTAX: &'static str = "generic vhost-user parameters \
+    \"virtio_id=<ID number for virtio device type (FS, block, net, etc) or symbolic name>,\
+    socket=<socket_path>,\
+    queue_sizes=<list of queue sizes>,\
+    id=<device_id>,pci_segment=<segment_id>\"";
+
+    pub fn parse(vhost_user: &str) -> Result<Self> {
+        let mut parser = OptionParser::new();
+        parser
+            .add("virtio_id")
+            .add("queue_sizes")
+            .add("socket")
+            .add("id")
+            .add("pci_segment");
+        parser
+            .parse(vhost_user)
+            .map_err(Error::ParseGenericVhostUser)?;
+
+        let socket = parser
+            .get("socket")
+            .ok_or(Error::ParseGenericVhostUserSockMissing)?;
+
+        let IntegerList(queue_sizes) = parser
+            .convert("queue_sizes")
+            .map_err(Error::ParseGenericVhostUser)?
+            .ok_or(Error::ParseGenericVhostUserQueueSizeMissing)?;
+        let device_type_str = parser
+            .convert::<String>("virtio_id")
+            .map_err(Error::ParseGenericVhostUser)?
+            .ok_or(Error::ParseGenericVhostUserVirtioIdMissing)?;
+        let device_type = match device_type_str.as_bytes() {
+            b"net" => VIRTIO_ID_NET,
+            b"block" => VIRTIO_ID_BLOCK,
+            b"console" => VIRTIO_ID_CONSOLE,
+            b"rng" => VIRTIO_ID_RNG,
+            b"balloon" => VIRTIO_ID_BALLOON,
+            b"iomem" => VIRTIO_ID_IOMEM,
+            b"rpmsg" => VIRTIO_ID_RPMSG,
+            b"scsi" => VIRTIO_ID_SCSI,
+            b"9p" => VIRTIO_ID_9P,
+            b"mac80211_wlan" => VIRTIO_ID_MAC80211_WLAN,
+            b"rproc_serial" => VIRTIO_ID_RPROC_SERIAL,
+            b"caif" => VIRTIO_ID_CAIF,
+            b"memory_balloon" => VIRTIO_ID_MEMORY_BALLOON,
+            b"gpu" => VIRTIO_ID_GPU,
+            b"clock" => VIRTIO_ID_CLOCK,
+            b"input" => VIRTIO_ID_INPUT,
+            b"vsock" => VIRTIO_ID_VSOCK,
+            b"crypto" => VIRTIO_ID_CRYPTO,
+            b"signal_dist" => VIRTIO_ID_SIGNAL_DIST,
+            b"pstore" => VIRTIO_ID_PSTORE,
+            b"iommu" => VIRTIO_ID_IOMMU,
+            b"mem" => VIRTIO_ID_MEM,
+            b"sound" => VIRTIO_ID_SOUND,
+            b"fs" => VIRTIO_ID_FS,
+            b"pmem" => VIRTIO_ID_PMEM,
+            b"rpmb" => VIRTIO_ID_RPMB,
+            b"mac80211_hwsim" => VIRTIO_ID_MAC80211_HWSIM,
+            b"video_encoder" => VIRTIO_ID_VIDEO_ENCODER,
+            b"video_decoder" => VIRTIO_ID_VIDEO_DECODER,
+            b"scmi" => VIRTIO_ID_SCMI,
+            b"nitro_sec_mod" => VIRTIO_ID_NITRO_SEC_MOD,
+            b"i2c" => VIRTIO_ID_I2C_ADAPTER,
+            b"watchdog" => VIRTIO_ID_WATCHDOG,
+            b"can" => VIRTIO_ID_CAN,
+            b"dmabuf" => VIRTIO_ID_DMABUF,
+            b"param_serv" => VIRTIO_ID_PARAM_SERV,
+            b"audio_policy" => VIRTIO_ID_AUDIO_POLICY,
+            b"bt" => VIRTIO_ID_BT,
+            b"gpio" => VIRTIO_ID_GPIO,
+            b"rdma" => 42,
+            b"camera" => 43,
+            b"ism" => 44,
+            b"spi" => 45,
+            b"tee" => 46,
+            b"cpu_balloon" => 47,
+            b"media" => 48,
+            b"usb" => 49,
+            [b'1'..=b'9', ..] => match device_type_str.parse() {
+                Ok(id) => id,
+                Err(_) => return Err(Error::ParseGenericVhostUserVirtioIdInvalid(device_type_str)),
+            },
+            _ => return Err(Error::ParseGenericVhostUserVirtioIdInvalid(device_type_str)),
+        };
+        match device_type {
+            // vhost-user devices of these types definitely cannot work.
+            // Cloud Hypervisor needs to know if an IOMMU exists so that it
+            // can perform address translation, and a vhost-user device has
+            // no supported way to reset the guest.
+            VIRTIO_ID_WATCHDOG | VIRTIO_ID_IOMMU => {
+                return Err(Error::ParseGenericVhostUserVirtioIdUnsupported(
+                    device_type_str,
+                ));
+            }
+            _ => {}
+        }
+        let id = parser.get("id");
+        let pci_segment = parser
+            .convert("pci_segment")
+            .map_err(Error::ParseGenericVhostUser)?
+            .unwrap_or_default();
+        let mut converted_queue_sizes: Vec<u16> = Vec::new();
+        for (offset, &queue_size) in queue_sizes.iter().enumerate() {
+            match queue_size.try_into() {
+                Err(_) => {
+                    return Err(Error::ParseGenericVhostUserQueueSizeTooLarge(
+                        offset, queue_size,
+                    ));
+                }
+                Ok(queue_size) => converted_queue_sizes.push(queue_size),
+            }
+        }
+
+        Ok(GenericVhostUserConfig {
+            socket: socket.into(),
+            device_type,
+            id,
+            pci_segment,
+            queue_sizes: converted_queue_sizes,
+        })
+    }
+
+    pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+        if let Some(platform_config) = vm_config.platform.as_ref() {
+            if self.pci_segment >= platform_config.num_pci_segments {
+                return Err(ValidationError::InvalidPciSegment(self.pci_segment));
+            }
+
+            if let Some(iommu_segments) = platform_config.iommu_segments.as_ref()
+                && iommu_segments.contains(&self.pci_segment)
+            {
+                return Err(ValidationError::IommuNotSupportedOnSegment(
+                    self.pci_segment,
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
 impl FsConfig {
     pub const SYNTAX: &'static str = "virtio-fs parameters \
     \"tag=<tag_name>,socket=<socket_path>,num_queues=<number_of_queues>,\
@@ -1649,7 +1900,10 @@ impl FsConfig {
 
     pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
         if self.num_queues > vm_config.cpus.boot_vcpus as usize {
-            return Err(ValidationError::TooManyQueues);
+            return Err(ValidationError::TooManyQueues(
+                self.num_queues,
+                vm_config.cpus.boot_vcpus as usize,
+            ));
         }
 
         if let Some(platform_config) = vm_config.platform.as_ref() {
@@ -2164,6 +2418,7 @@ impl VsockConfig {
 impl NumaConfig {
     pub const SYNTAX: &'static str = "Settings related to a given NUMA node \
         \"guest_numa_id=<node_id>,cpus=<cpus_id>,distances=<list_of_distances_to_destination_nodes>,\
+        device_id=<device_id>,\
         memory_zones=<list_of_memory_zones>,\
         pci_segments=<list_of_pci_segments>\"";
 
@@ -2173,6 +2428,7 @@ impl NumaConfig {
             .add("guest_numa_id")
             .add("cpus")
             .add("distances")
+            .add("device_id")
             .add("memory_zones")
             .add("pci_segments");
 
@@ -2181,7 +2437,11 @@ impl NumaConfig {
         let guest_numa_id = parser
             .convert::<u32>("guest_numa_id")
             .map_err(Error::ParseNuma)?
-            .unwrap_or(0);
+            .ok_or_else(|| {
+                Error::ParseNuma(OptionParserError::InvalidValue(
+                    "guest_numa_id is required for all NUMA nodes".to_string(),
+                ))
+            })?;
         let cpus = parser
             .convert::<IntegerList>("cpus")
             .map_err(Error::ParseNuma)?
@@ -2197,6 +2457,7 @@ impl NumaConfig {
                     })
                     .collect()
             });
+        let device_id = parser.get("device_id");
         let memory_zones = parser
             .convert::<StringList>("memory_zones")
             .map_err(Error::ParseNuma)?
@@ -2205,13 +2466,71 @@ impl NumaConfig {
             .convert::<IntegerList>("pci_segments")
             .map_err(Error::ParseNuma)?
             .map(|v| v.0.iter().map(|e| *e as u16).collect());
+        if device_id.is_some() && (cpus.is_some() || memory_zones.is_some()) {
+            return Err(Error::ParseNuma(OptionParserError::InvalidValue(
+                "device_id in numa config cannot be used with cpus or memory zones".to_string(),
+            )));
+        }
         Ok(NumaConfig {
             guest_numa_id,
             cpus,
             distances,
+            device_id,
             memory_zones,
             pci_segments,
         })
+    }
+
+    pub fn is_generic_initiator(&self) -> bool {
+        self.device_id.is_some()
+    }
+
+    /// Validates NumaConfig
+    pub fn validate(&self) -> result::Result<(), ValidationError> {
+        match (&self.device_id, &self.cpus, &self.memory_zones) {
+            (Some(device_id), None, None) => {
+                // Valid generic initiator case
+                if device_id.is_empty() {
+                    return Err(ValidationError::InvalidNumaConfig(
+                        "device_id in numa config cannot be empty".to_string(),
+                    ));
+                }
+                Ok(())
+            }
+            (None, Some(cpus), _) => {
+                // Standard NUMA with cpus
+                if cpus.is_empty() {
+                    return Err(ValidationError::InvalidNumaConfig(
+                        "cpus list in numa config cannot be empty".to_string(),
+                    ));
+                }
+                Ok(())
+            }
+            (None, _, Some(memory_zones)) => {
+                // Standard NUMA with memory_zones (cpus is None here)
+                if memory_zones.is_empty() {
+                    return Err(ValidationError::InvalidNumaConfig(
+                        "memory_zones in numa config cannot be empty".to_string(),
+                    ));
+                }
+                Ok(())
+            }
+            _ => {
+                // Default handles all error cases
+                if self.device_id.is_some() && (self.cpus.is_some() || self.memory_zones.is_some())
+                {
+                    Err(ValidationError::InvalidNumaConfig(
+                        "device_id in numa config is mutually exclusive with cpus and memory_zones"
+                            .to_string(),
+                    ))
+                } else {
+                    Err(ValidationError::InvalidNumaConfig(
+                        "numa config must specify either device_id or cpus/memory_zones"
+                            .to_string(),
+                    ))
+                }
+            }
+        }
     }
 }
 
@@ -2251,27 +2570,65 @@ where
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
+pub enum MemoryRestoreMode {
+    /// Restore by eagerly copying the snapshot into guest RAM before resume.
+    #[default]
+    Copy,
+    /// Restore lazily by faulting snapshot pages into guest RAM on demand.
+    OnDemand,
+}
+
+#[derive(Debug, Error)]
+pub enum MemoryRestoreModeParseError {
+    #[error("Invalid value: {0}")]
+    InvalidValue(String),
+}
+
+impl FromStr for MemoryRestoreMode {
+    type Err = MemoryRestoreModeParseError;
+
+    fn from_str(s: &str) -> result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "copy" => Ok(Self::Copy),
+            "ondemand" => Ok(Self::OnDemand),
+            _ => Err(MemoryRestoreModeParseError::InvalidValue(s.to_owned())),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
 pub struct RestoreConfig {
     pub source_url: PathBuf,
     #[serde(default)]
     pub prefault: bool,
     #[serde(default)]
+    pub memory_restore_mode: MemoryRestoreMode,
+    #[serde(default)]
     pub net_fds: Option<Vec<RestoredNetConfig>>,
+    #[serde(default)]
+    pub resume: bool,
 }
 
 impl RestoreConfig {
     pub const SYNTAX: &'static str = "Restore from a VM snapshot. \
-        \nRestore parameters \"source_url=<source_url>,prefault=on|off,\
-        net_fds=<list_of_net_ids_with_their_associated_fds>\" \
+        \nRestore parameters \"source_url=<source_url>,prefault=on|off,memory_restore_mode=copy|ondemand,\
+        net_fds=<list_of_net_ids_with_their_associated_fds>,resume=true|false\" \
         \n`source_url` should be a valid URL (e.g file:///foo/bar or tcp://192.168.1.10/foo) \
-        \n`prefault` brings memory pages in when enabled (disabled by default) \
+        \n`prefault` controls eager prefaulting for the copy-based restore path (disabled by default) \
+        \n`memory_restore_mode=copy` preserves the existing eager read-copy restore behavior, while `memory_restore_mode=ondemand` enables lazy demand paging and fails restore if userfaultfd support is unavailable \
         \n`net_fds` is a list of net ids with new file descriptors. \
-        Only net devices backed by FDs directly are needed as input.";
+        Only net devices backed by FDs directly are needed as input.\
+        \n `resume` controls whether the VM will be directly resumed after restore ";
 
     pub fn parse(restore: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
-        parser.add("source_url").add("prefault").add("net_fds");
+        parser
+            .add("source_url")
+            .add("prefault")
+            .add("memory_restore_mode")
+            .add("net_fds")
+            .add("resume");
         parser.parse(restore).map_err(Error::ParseRestore)?;
 
         let source_url = parser
@@ -2283,6 +2640,10 @@ impl RestoreConfig {
             .map_err(Error::ParseRestore)?
             .unwrap_or(Toggle(false))
             .0;
+        let memory_restore_mode = parser
+            .convert::<MemoryRestoreMode>("memory_restore_mode")
+            .map_err(Error::ParseRestore)?
+            .unwrap_or_default();
         let net_fds = parser
             .convert::<Tuple<String, Vec<u64>>>("net_fds")
             .map_err(Error::ParseRestore)?
@@ -2295,11 +2656,18 @@ impl RestoreConfig {
                     })
                     .collect()
             });
+        let resume = parser
+            .convert::<Toggle>("resume")
+            .map_err(Error::ParseRestore)?
+            .unwrap_or(Toggle(false))
+            .0;
 
         Ok(RestoreConfig {
             source_url,
             prefault,
+            memory_restore_mode,
             net_fds,
+            resume,
         })
     }
 
@@ -2307,6 +2675,10 @@ impl RestoreConfig {
     // corresponding 'RestoreNetConfig' with a matched 'id' and expected
     // number of FDs.
     pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+        if self.memory_restore_mode == MemoryRestoreMode::OnDemand && self.prefault {
+            return Err(ValidationError::InvalidRestorePrefaultWithOnDemand);
+        }
+
         let mut restored_net_with_fds = HashMap::new();
         for n in self.net_fds.iter().flatten() {
             assert_eq!(
@@ -2550,7 +2922,10 @@ impl VmConfig {
         }
 
         if self.cpus.max_vcpus < self.cpus.boot_vcpus {
-            return Err(ValidationError::CpusMaxLowerThanBoot);
+            return Err(ValidationError::CpusMaxLowerThanBoot(
+                self.cpus.max_vcpus,
+                self.cpus.boot_vcpus,
+            ));
         }
 
         if self.cpus.max_vcpus > MAX_SUPPORTED_CPUS {
@@ -2621,6 +2996,17 @@ impl VmConfig {
                 fs.validate(self)?;
 
                 Self::validate_identifier(&mut id_list, &fs.id)?;
+            }
+        }
+
+        if let Some(generic_vhost_user_devices) = &self.generic_vhost_user {
+            if !generic_vhost_user_devices.is_empty() && !self.backed_by_shared_memory() {
+                return Err(ValidationError::VhostUserRequiresSharedMemory);
+            }
+            for generic_vhost_user_device in generic_vhost_user_devices {
+                generic_vhost_user_device.validate(self)?;
+
+                Self::validate_identifier(&mut id_list, &generic_vhost_user_device.id)?;
             }
         }
 
@@ -2746,6 +3132,7 @@ impl VmConfig {
             let mut used_numa_node_memory_zones = HashMap::new();
             let mut used_pci_segments = HashMap::new();
             for numa_node in numa.iter() {
+                numa_node.validate()?;
                 if let Some(memory_zones) = numa_node.memory_zones.clone() {
                     for memory_zone in memory_zones.iter() {
                         if used_numa_node_memory_zones.contains_key(memory_zone) {
@@ -2874,6 +3261,15 @@ impl VmConfig {
                 fs_config_list.push(FsConfig::parse(item)?);
             }
             fs = Some(fs_config_list);
+        }
+
+        let mut generic_vhost_user: Option<Vec<GenericVhostUserConfig>> = None;
+        if let Some(generic_vhost_user_list) = &vm_params.generic_vhost_user {
+            let mut generic_vhost_user_config_list = Vec::new();
+            for item in generic_vhost_user_list.iter() {
+                generic_vhost_user_config_list.push(GenericVhostUserConfig::parse(item)?);
+            }
+            generic_vhost_user = Some(generic_vhost_user_config_list);
         }
 
         let mut pmem: Option<Vec<PmemConfig>> = None;
@@ -3011,6 +3407,7 @@ impl VmConfig {
             net,
             rng,
             balloon,
+            generic_vhost_user,
             fs,
             pmem,
             serial,
@@ -3071,6 +3468,13 @@ impl VmConfig {
             let len = fs.len();
             fs.retain(|dev| dev.id.as_ref().map(|id| id.as_ref()) != Some(id));
             removed |= fs.len() != len;
+        }
+
+        // Remove if generic vhost-user device
+        if let Some(generic_vhost_user) = self.generic_vhost_user.as_mut() {
+            let len = generic_vhost_user.len();
+            generic_vhost_user.retain(|dev| dev.id.as_ref().map(|id| id.as_ref()) != Some(id));
+            removed |= generic_vhost_user.len() != len;
         }
 
         // Remove if net device
@@ -3145,6 +3549,7 @@ impl Clone for VmConfig {
             #[cfg(feature = "pvmemcontrol")]
             pvmemcontrol: self.pvmemcontrol.clone(),
             fs: self.fs.clone(),
+            generic_vhost_user: self.generic_vhost_user.clone(),
             pmem: self.pmem.clone(),
             serial: self.serial.clone(),
             console: self.console.clone(),
@@ -3255,6 +3660,42 @@ mod unit_tests {
                 ..Default::default()
             },
         );
+
+        // Test core_scheduling parsing
+        assert_eq!(
+            CpusConfig::parse("boot=1,core_scheduling=vm")?,
+            CpusConfig {
+                boot_vcpus: 1,
+                max_vcpus: 1,
+                core_scheduling: CoreScheduling::Vm,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            CpusConfig::parse("boot=1,core_scheduling=vcpu")?,
+            CpusConfig {
+                boot_vcpus: 1,
+                max_vcpus: 1,
+                core_scheduling: CoreScheduling::Vcpu,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            CpusConfig::parse("boot=1,core_scheduling=off")?,
+            CpusConfig {
+                boot_vcpus: 1,
+                max_vcpus: 1,
+                core_scheduling: CoreScheduling::Off,
+                ..Default::default()
+            }
+        );
+        // Default (no core_scheduling specified) should be Vm
+        assert_eq!(
+            CpusConfig::parse("boot=1")?.core_scheduling,
+            CoreScheduling::Vm
+        );
+        // Invalid value should error
+        CpusConfig::parse("boot=1,core_scheduling=invalid").unwrap_err();
 
         Ok(())
     }
@@ -3414,6 +3855,10 @@ mod unit_tests {
             pci_segment: 0,
             serial: None,
             queue_affinity: None,
+            backing_files: false,
+            sparse: true,
+            image_type: ImageType::Unknown,
+            lock_granularity: LockGranularityChoice::default(),
         }
     }
 
@@ -3436,6 +3881,7 @@ mod unit_tests {
                 path: None,
                 vhost_socket: Some(String::from("/tmp/sock")),
                 vhost_user: true,
+                image_type: ImageType::Unknown,
                 ..disk_fixture()
             }
         );
@@ -3481,6 +3927,20 @@ mod unit_tests {
             DiskConfig::parse("path=/path/to_file,rate_limit_group=group0")?,
             DiskConfig {
                 rate_limit_group: Some("group0".to_string()),
+                ..disk_fixture()
+            }
+        );
+        assert_eq!(
+            DiskConfig::parse("path=/path/to_file,lock_granularity=full")?,
+            DiskConfig {
+                lock_granularity: LockGranularityChoice::Full,
+                ..disk_fixture()
+            }
+        );
+        assert_eq!(
+            DiskConfig::parse("path=/path/to_file,lock_granularity=byte-range")?,
+            DiskConfig {
+                lock_granularity: LockGranularityChoice::ByteRange,
                 ..disk_fixture()
             }
         );
@@ -3662,6 +4122,93 @@ mod unit_tests {
             }
         );
 
+        Ok(())
+    }
+
+    #[track_caller]
+    #[allow(clippy::too_many_arguments)]
+    fn make_vhost_user_config(
+        socket: &str,
+        virtio_id: u64,
+        id: &str,
+        pci_segment: u64,
+        queue_sizes: &IntegerList,
+    ) {
+        assert!(!socket.contains(",[]\n\r\0\""));
+        assert!(!id.contains(",[]\n\r\0\""));
+        let config = GenericVhostUserConfig::parse(&format!(
+            "virtio_id={virtio_id},socket=\"{socket}\",\
+id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
+        ));
+        if pci_segment <= u16::MAX.into()
+            && virtio_id <= u32::MAX.into()
+            && virtio_id != u64::from(VIRTIO_ID_BALLOON)
+            && virtio_id != u64::from(VIRTIO_ID_WATCHDOG)
+            && virtio_id != u64::from(VIRTIO_ID_IOMMU)
+            && queue_sizes.0.iter().all(|&f| f <= u16::MAX.into())
+        {
+            assert_eq!(
+                config.unwrap(),
+                GenericVhostUserConfig {
+                    socket: socket.into(),
+                    id: Some(id.to_owned()),
+                    device_type: u32::try_from(virtio_id).unwrap(),
+                    pci_segment: u16::try_from(pci_segment).unwrap(),
+                    queue_sizes: queue_sizes
+                        .0
+                        .iter()
+                        .map(|&f| u16::try_from(f).unwrap())
+                        .collect(),
+                }
+            );
+        } else {
+            config.unwrap_err();
+        }
+    }
+
+    #[test]
+    fn test_parse_vhost_user() -> Result<()> {
+        // all parameters must be supplied, except pci_segment
+        GenericVhostUserConfig::parse("").unwrap_err();
+        GenericVhostUserConfig::parse("virtio_id=1").unwrap_err();
+        GenericVhostUserConfig::parse("queue_size=1").unwrap_err();
+        GenericVhostUserConfig::parse("socket=/tmp/sock").unwrap_err();
+        GenericVhostUserConfig::parse("id=1").unwrap_err();
+        make_vhost_user_config(
+            "/dev/null/doesnotexist",
+            100,
+            "Something",
+            10,
+            &IntegerList(vec![u16::MAX.into(), 20u16.into()]),
+        );
+        make_vhost_user_config(
+            "/dev/null/doesnotexist",
+            100,
+            "Something",
+            10,
+            &IntegerList(vec![u16::MAX.into()]),
+        );
+        make_vhost_user_config(
+            "/dev/null/doesnotexist",
+            u64::from(u32::MAX) + 1,
+            "Something",
+            10,
+            &IntegerList(vec![20u64]),
+        );
+        make_vhost_user_config(
+            "/dev/null/doesnotexist",
+            u64::from(u32::MAX) + 1,
+            "Something",
+            10,
+            &IntegerList(vec![20u64]),
+        );
+        make_vhost_user_config(
+            "/dev/null/doesnotexist",
+            u64::from(u32::MAX) + 1,
+            "Something",
+            10,
+            &IntegerList(vec![20u64]),
+        );
         Ok(())
     }
 
@@ -3889,13 +4436,130 @@ mod unit_tests {
     }
 
     #[test]
+    fn test_numa_config_parsing() -> Result<()> {
+        // Error when device_id and cpu/memory are present
+        let invalid_input = "guest_numa_id=0,cpus=[0,1],distances=[0@25,1@20],\
+                                device_id=vfio0,memory_zones=[mem1],pci_segments=[0]";
+        NumaConfig::parse(invalid_input).unwrap_err();
+        // Successful numa config parsing
+        let standard_input = "guest_numa_id=1,cpus=[2,3],distances=[0@20],\
+                                memory_zones=[mem0],pci_segments=[0]";
+        let expected_standard = NumaConfig {
+            guest_numa_id: 1,
+            cpus: Some(vec![2, 3]),
+            distances: Some(vec![NumaDistance {
+                destination: 0,
+                distance: 20,
+            }]),
+            device_id: None,
+            memory_zones: Some(vec!["mem0".to_string()]),
+            pci_segments: Some(vec![0]),
+        };
+        assert_eq!(NumaConfig::parse(standard_input)?, expected_standard);
+        // Successful generic initiator config parse
+        let gi_input = "guest_numa_id=2,device_id=vfio1,distances=[0@30],pci_segments=[1]";
+        let expected_gi = NumaConfig {
+            guest_numa_id: 2,
+            cpus: None,
+            distances: Some(vec![NumaDistance {
+                destination: 0,
+                distance: 30,
+            }]),
+            device_id: Some("vfio1".to_string()),
+            memory_zones: None,
+            pci_segments: Some(vec![1]),
+        };
+        assert_eq!(NumaConfig::parse(gi_input)?, expected_gi);
+        Ok(())
+    }
+
+    #[test]
+    fn test_numa_config_generic_initiator_valid() {
+        // device_id specified, no cpus/memory_zones
+        let config = NumaConfig {
+            guest_numa_id: 0,
+            cpus: None,
+            distances: Some(vec![NumaDistance {
+                destination: 1,
+                distance: 20,
+            }]),
+            memory_zones: None,
+            device_id: Some("vfio0".to_string()),
+            pci_segments: None,
+        };
+        config.validate().unwrap();
+        assert!(config.is_generic_initiator());
+    }
+
+    #[test]
+    fn test_numa_config_invalid_device_id() {
+        // empty device_id
+        let config = NumaConfig {
+            guest_numa_id: 0,
+            cpus: None,
+            distances: None,
+            memory_zones: None,
+            device_id: Some(String::new()),
+            pci_segments: None,
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_numa_config_invalid_both_device_cpus() {
+        // device_id and cpus specified
+        let config = NumaConfig {
+            guest_numa_id: 0,
+            cpus: Some(vec![0, 1]),
+            distances: None,
+            device_id: Some("vfio0".to_string()),
+            memory_zones: None,
+            pci_segments: None,
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_numa_config_invalid_both_device_memory() {
+        // device_id and memory zones specified
+        let config = NumaConfig {
+            guest_numa_id: 0,
+            cpus: None,
+            distances: None,
+            device_id: Some("vfio0".to_string()),
+            memory_zones: Some(vec!["mem0".to_string()]),
+            pci_segments: None,
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_numa_config_standard_valid() {
+        // No device_id
+        let config = NumaConfig {
+            guest_numa_id: 0,
+            cpus: Some(vec![0, 1]),
+            distances: Some(vec![NumaDistance {
+                destination: 1,
+                distance: 20,
+            }]),
+            device_id: None,
+            memory_zones: Some(vec!["mem0".to_string()]),
+            pci_segments: None,
+        };
+        config.validate().unwrap();
+    }
+
+    #[test]
     fn test_restore_parsing() -> Result<()> {
         assert_eq!(
             RestoreConfig::parse("source_url=/path/to/snapshot")?,
             RestoreConfig {
                 source_url: PathBuf::from("/path/to/snapshot"),
                 prefault: false,
+                memory_restore_mode: MemoryRestoreMode::Copy,
                 net_fds: None,
+                resume: false,
             }
         );
         assert_eq!(
@@ -3905,6 +4569,7 @@ mod unit_tests {
             RestoreConfig {
                 source_url: PathBuf::from("/path/to/snapshot"),
                 prefault: false,
+                memory_restore_mode: MemoryRestoreMode::Copy,
                 net_fds: Some(vec![
                     RestoredNetConfig {
                         id: "net0".to_string(),
@@ -3917,11 +4582,51 @@ mod unit_tests {
                         fds: Some(vec![5, 6, 7, 8]),
                     }
                 ]),
+                resume: false,
+            }
+        );
+        assert_eq!(
+            RestoreConfig::parse("source_url=/path/to/snapshot,memory_restore_mode=ondemand")?,
+            RestoreConfig {
+                source_url: PathBuf::from("/path/to/snapshot"),
+                prefault: false,
+                memory_restore_mode: MemoryRestoreMode::OnDemand,
+                net_fds: None,
+                resume: false,
+            }
+        );
+        assert_eq!(
+            RestoreConfig::parse("source_url=/path/to/snapshot,resume=on")?,
+            RestoreConfig {
+                source_url: PathBuf::from("/path/to/snapshot"),
+                prefault: false,
+                memory_restore_mode: MemoryRestoreMode::Copy,
+                net_fds: None,
+                resume: true,
             }
         );
         // Parsing should fail as source_url is a required field
         RestoreConfig::parse("prefault=off").unwrap_err();
+        RestoreConfig::parse("source_url=/path/to/snapshot,memory_restore_mode=bogus").unwrap_err();
         Ok(())
+    }
+
+    #[test]
+    fn test_restore_config_serde() {
+        assert_eq!(
+            serde_json::from_str::<RestoreConfig>(r#"{"source_url":"/path/to/snapshot"}"#)
+                .unwrap()
+                .memory_restore_mode,
+            MemoryRestoreMode::Copy
+        );
+        assert_eq!(
+            serde_json::from_str::<RestoreConfig>(
+                r#"{"source_url":"/path/to/snapshot","memory_restore_mode":"OnDemand"}"#
+            )
+            .unwrap()
+            .memory_restore_mode,
+            MemoryRestoreMode::OnDemand
+        );
     }
 
     #[test]
@@ -3934,6 +4639,7 @@ mod unit_tests {
             rate_limit_groups: None,
             disks: None,
             rng: RngConfig::default(),
+            generic_vhost_user: None,
             balloon: None,
             fs: None,
             pmem: None,
@@ -3985,6 +4691,7 @@ mod unit_tests {
         let valid_config = RestoreConfig {
             source_url: PathBuf::from("/path/to/snapshot"),
             prefault: false,
+            memory_restore_mode: MemoryRestoreMode::Copy,
             net_fds: Some(vec![
                 RestoredNetConfig {
                     id: "net0".to_string(),
@@ -3997,6 +4704,7 @@ mod unit_tests {
                     fds: Some(vec![7, 8]),
                 },
             ]),
+            resume: false,
         };
         valid_config.validate(&snapshot_vm_config).unwrap();
 
@@ -4059,7 +4767,9 @@ mod unit_tests {
         let another_valid_config = RestoreConfig {
             source_url: PathBuf::from("/path/to/snapshot"),
             prefault: false,
+            memory_restore_mode: MemoryRestoreMode::Copy,
             net_fds: None,
+            resume: false,
         };
         snapshot_vm_config.net = Some(vec![NetConfig {
             id: Some("net2".to_owned()),
@@ -4067,6 +4777,18 @@ mod unit_tests {
             ..net_fixture()
         }]);
         another_valid_config.validate(&snapshot_vm_config).unwrap();
+
+        let invalid_restore_mode = RestoreConfig {
+            source_url: PathBuf::from("/path/to/snapshot"),
+            prefault: true,
+            memory_restore_mode: MemoryRestoreMode::OnDemand,
+            net_fds: None,
+            resume: false,
+        };
+        assert_eq!(
+            invalid_restore_mode.validate(&snapshot_vm_config),
+            Err(ValidationError::InvalidRestorePrefaultWithOnDemand)
+        );
     }
 
     fn platform_fixture() -> PlatformConfig {
@@ -4089,6 +4811,7 @@ mod unit_tests {
             guest_numa_id: 0,
             cpus: None,
             distances: None,
+            device_id: None,
             memory_zones: None,
             pci_segments: None,
         }
@@ -4138,6 +4861,7 @@ mod unit_tests {
             },
             balloon: None,
             fs: None,
+            generic_vhost_user: None,
             pmem: None,
             serial: ConsoleConfig {
                 file: None,
@@ -4204,7 +4928,7 @@ mod unit_tests {
         invalid_config.cpus.boot_vcpus = 32;
         assert_eq!(
             invalid_config.validate(),
-            Err(ValidationError::CpusMaxLowerThanBoot)
+            Err(ValidationError::CpusMaxLowerThanBoot(16, 32))
         );
 
         let mut invalid_config = valid_config.clone();
@@ -4292,7 +5016,7 @@ mod unit_tests {
         }]);
         assert_eq!(
             invalid_config.validate(),
-            Err(ValidationError::VnetReservedFd)
+            Err(ValidationError::VnetReservedFd(0))
         );
 
         let mut invalid_config = valid_config.clone();
@@ -4602,11 +5326,13 @@ mod unit_tests {
         invalid_config.numa = Some(vec![
             NumaConfig {
                 guest_numa_id: 0,
+                cpus: Some(vec![0]),
                 pci_segments: Some(vec![1]),
                 ..numa_fixture()
             },
             NumaConfig {
                 guest_numa_id: 1,
+                cpus: Some(vec![1]),
                 pci_segments: Some(vec![1]),
                 ..numa_fixture()
             },
@@ -4642,10 +5368,12 @@ mod unit_tests {
         invalid_config.numa = Some(vec![
             NumaConfig {
                 guest_numa_id: 0,
+                cpus: Some(vec![0]),
                 ..numa_fixture()
             },
             NumaConfig {
                 guest_numa_id: 1,
+                cpus: Some(vec![1]),
                 pci_segments: Some(vec![0]),
                 ..numa_fixture()
             },
@@ -4659,11 +5387,13 @@ mod unit_tests {
         invalid_config.numa = Some(vec![
             NumaConfig {
                 guest_numa_id: 0,
+                cpus: Some(vec![0]),
                 pci_segments: Some(vec![0]),
                 ..numa_fixture()
             },
             NumaConfig {
                 guest_numa_id: 1,
+                cpus: Some(vec![1]),
                 pci_segments: Some(vec![1]),
                 ..numa_fixture()
             },

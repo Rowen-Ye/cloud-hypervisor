@@ -171,6 +171,7 @@ pub struct HypervisorVmConfig {
     #[cfg(feature = "sev_snp")]
     pub mem_size: u64,
     pub nested: bool,
+    pub smt_enabled: bool,
 }
 
 #[derive(Copy, Clone)]
@@ -224,6 +225,8 @@ macro_rules! set_x86_64_reg {
                         StandardRegisters::Kvm(s) => s.$reg_name = val,
                         #[cfg(any(feature = "mshv", feature = "mshv_emulator"))]
                         StandardRegisters::Mshv(s) => s.$reg_name = val,
+                        #[allow(unreachable_patterns)]
+                        _ => { let _ = val; unreachable!("no x86_64 register backend available") },
                     }
                 }
             }
@@ -242,6 +245,8 @@ macro_rules! get_x86_64_reg {
                         StandardRegisters::Kvm(s) => s.$reg_name,
                         #[cfg(any(feature = "mshv", feature = "mshv_emulator"))]
                         StandardRegisters::Mshv(s) => s.$reg_name,
+                        #[allow(unreachable_patterns)]
+                        _ => unreachable!("no x86_64 register backend available"),
                     }
                 }
             }

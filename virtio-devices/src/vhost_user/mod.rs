@@ -1,11 +1,11 @@
 // Copyright 2019 Intel Corporation. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::io;
 use std::ops::Deref;
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
+use std::{io, thread};
 
 use anyhow::anyhow;
 use log::error;
@@ -17,8 +17,9 @@ use vhost::vhost_user::message::{
 };
 use vhost::vhost_user::{FrontendReqHandler, VhostUserFrontendReqHandler};
 use virtio_queue::{Error as QueueError, Queue};
+use vm_memory::guest_memory::Error as MmapError;
 use vm_memory::mmap::MmapRegionError;
-use vm_memory::{Address, Error as MmapError, GuestAddressSpace, GuestMemory, GuestMemoryAtomic};
+use vm_memory::{Address, GuestAddressSpace, GuestMemory, GuestMemoryAtomic};
 use vm_migration::protocol::MemoryRangeTable;
 use vm_migration::{MigratableError, Snapshot};
 use vmm_sys_util::eventfd::EventFd;
@@ -28,16 +29,18 @@ use crate::{
     ActivateError, EPOLL_HELPER_EVENT_LAST, EpollHelper, EpollHelperError, EpollHelperHandler,
     GuestMemoryMmap, GuestRegionMmap, VIRTIO_F_IN_ORDER, VIRTIO_F_NOTIFICATION_DATA,
     VIRTIO_F_ORDER_PLATFORM, VIRTIO_F_RING_EVENT_IDX, VIRTIO_F_RING_INDIRECT_DESC,
-    VIRTIO_F_VERSION_1, VirtioInterrupt,
+    VIRTIO_F_VERSION_1, VirtioCommon, VirtioInterrupt,
 };
 
 pub mod blk;
 pub mod fs;
+pub mod generic_vhost_user;
 pub mod net;
 pub mod vu_common_ctrl;
 
 pub use self::blk::Blk;
 pub use self::fs::*;
+pub use self::generic_vhost_user::GenericVhostUser;
 pub use self::net::Net;
 pub use self::vu_common_ctrl::VhostUserConfig;
 
@@ -145,6 +148,16 @@ pub enum Error {
     NewMmapRegion(#[source] MmapRegionError),
     #[error("Could not find the shm log region")]
     MissingShmLogRegion,
+    #[error("Failed setting device state fd")]
+    VhostUserSetDeviceStateFd(#[source] VhostError),
+    #[error("Failed checking device state")]
+    VhostUserCheckDeviceState(#[source] VhostError),
+    #[error("Failed saving/restoring backend state")]
+    SaveRestoreBackendState(#[source] io::Error),
+    #[error("Vring bases count ({0}) does not match queue count ({1})")]
+    VringBasesCountMismatch(usize, usize),
+    #[error("Backend state and vring bases must both be present or both be absent")]
+    InconsistentBackendState,
 }
 type Result<T> = std::result::Result<T, Error>;
 
@@ -154,7 +167,8 @@ pub const DEFAULT_VIRTIO_FEATURES: u64 = (1 << VIRTIO_F_RING_INDIRECT_DESC)
     | (1 << VIRTIO_F_IN_ORDER)
     | (1 << VIRTIO_F_ORDER_PLATFORM)
     | (1 << VIRTIO_F_NOTIFICATION_DATA)
-    | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
+    | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits()
+    | VhostUserVirtioFeatures::LOG_ALL.bits();
 
 const HUP_CONNECTION_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 1;
 const BACKEND_REQ_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 2;
@@ -292,14 +306,47 @@ impl<S: VhostUserFrontendReqHandler> EpollHelperHandler for VhostUserEpollHandle
     }
 }
 
+/// Common snapshot state for all vhost-user device types.
+///
+/// Generic over `C` which is the device-specific config type
+/// (e.g. VirtioBlockConfig, VirtioFsConfig, VirtioNetConfig).
+/// Devices without a config type use `()`.
+#[derive(Default, Serialize, Deserialize)]
+pub struct VhostUserState<C> {
+    pub avail_features: u64,
+    pub acked_features: u64,
+    pub config: C,
+    pub acked_protocol_features: u64,
+    pub vu_num_queues: usize,
+    #[serde(default)]
+    pub backend_req_support: bool,
+    #[serde(default)]
+    pub vring_bases: Option<Vec<u64>>,
+    #[serde(default)]
+    pub backend_state: Option<Vec<u8>>,
+}
+
+impl<C> VhostUserState<C> {
+    pub fn validate(&self) -> Result<()> {
+        if self.backend_state.is_some() != self.vring_bases.is_some() {
+            return Err(Error::InconsistentBackendState);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Default)]
 pub struct VhostUserCommon {
+    pub virtio_common: VirtioCommon,
     pub vu: Option<Arc<Mutex<VhostUserHandle>>>,
     pub acked_protocol_features: u64,
     pub socket_path: String,
     pub vu_num_queues: usize,
     pub migration_started: bool,
     pub server: bool,
+    pub interrupt_cb: Option<Arc<dyn VirtioInterrupt>>,
+    pub vring_bases: Option<Vec<u64>>,
+    pub epoll_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl VhostUserCommon {
@@ -331,6 +378,7 @@ impl VhostUserCommon {
             .iter()
             .map(|(i, q, e)| (*i, vm_virtio::clone_queue(q), e.try_clone().unwrap()))
             .collect::<Vec<_>>();
+        let vring_bases = self.vring_bases.take();
         vu.lock()
             .unwrap()
             .setup_vhost_user(
@@ -340,8 +388,11 @@ impl VhostUserCommon {
                 acked_features,
                 &backend_req_handler,
                 inflight.as_mut(),
+                vring_bases.as_deref(),
             )
             .map_err(ActivateError::VhostUserSetup)?;
+
+        self.interrupt_cb = Some(interrupt_cb.clone());
 
         Ok(VhostUserEpollHandler {
             vu: vu.clone(),
@@ -375,15 +426,29 @@ impl VhostUserCommon {
     }
 
     pub fn shutdown(&mut self) {
-        if let Some(vu) = &self.vu {
-            // SAFETY: trivially safe
-            let _ = unsafe { libc::close(vu.lock().unwrap().socket_handle().as_raw_fd()) };
+        // Signal the epoll thread to exit, unpause it (it may be parked
+        // if the VM was paused for migration), then wait for it to finish.
+        // This ensures the thread drops its Arc<VhostUserHandle>, fully
+        // closing the vhost-user socket so the backend can accept a new
+        // connection from the destination.
+        if let Some(kill_evt) = self.virtio_common.kill_evt.take() {
+            let _ = kill_evt.write(1);
+        }
+        self.virtio_common.paused.store(false, Ordering::SeqCst);
+        if let Some(t) = self.epoll_thread.as_ref() {
+            t.thread().unpark();
+        }
+        if let Some(t) = self.epoll_thread.take() {
+            let _ = t.join();
         }
 
         // Remove socket path if needed
         if self.server {
             let _ = std::fs::remove_file(&self.socket_path);
         }
+
+        // Drop the vhost-user handle
+        self.vu = None;
     }
 
     pub fn add_memory_region(
@@ -425,15 +490,48 @@ impl VhostUserCommon {
         if let Some(vu) = &self.vu {
             vu.lock().unwrap().resume_vhost_user().map_err(|e| {
                 MigratableError::Resume(anyhow!("Error resuming vhost-user backend: {e:?}"))
-            })
-        } else {
-            Ok(())
+            })?;
         }
+        if let Some(interrupt_cb) = &self.interrupt_cb {
+            for i in 0..self.vu_num_queues {
+                interrupt_cb
+                    .trigger(crate::VirtioInterruptType::Queue(i as u16))
+                    .ok();
+            }
+        }
+        Ok(())
     }
 
-    pub fn snapshot<'a, T>(&mut self, state: &T) -> std::result::Result<Snapshot, MigratableError>
+    pub fn state<C: Default>(
+        &self,
+        config: C,
+    ) -> std::result::Result<VhostUserState<C>, MigratableError> {
+        let mut state = VhostUserState {
+            avail_features: self.virtio_common.avail_features,
+            acked_features: self.virtio_common.acked_features,
+            config,
+            acked_protocol_features: self.acked_protocol_features,
+            vu_num_queues: self.vu_num_queues,
+            ..Default::default()
+        };
+
+        if let Some(vu) = &self.vu {
+            let mut vu_locked = vu.lock().unwrap();
+            if vu_locked.supports_device_state() {
+                let (backend_state, vring_bases) = vu_locked.save_backend_state().map_err(|e| {
+                    MigratableError::Snapshot(anyhow!("Failed saving backend state: {e:?}"))
+                })?;
+                state.backend_state = Some(backend_state);
+                state.vring_bases = Some(vring_bases);
+            }
+        }
+
+        Ok(state)
+    }
+
+    pub fn snapshot<T>(&mut self, state: &T) -> std::result::Result<Snapshot, MigratableError>
     where
-        T: Serialize + Deserialize<'a>,
+        T: Serialize,
     {
         let snapshot = Snapshot::new_from_state(state)?;
 
@@ -506,15 +604,12 @@ impl VhostUserCommon {
         Ok(())
     }
 
-    pub fn complete_migration(
-        &mut self,
-        kill_evt: Option<EventFd>,
-    ) -> std::result::Result<(), MigratableError> {
+    pub fn complete_migration(&mut self) -> std::result::Result<(), MigratableError> {
         self.migration_started = false;
 
         // Make sure the device thread is killed in order to prevent from
         // reconnections to the socket.
-        if let Some(kill_evt) = kill_evt {
+        if let Some(kill_evt) = self.virtio_common.kill_evt.take() {
             kill_evt.write(1).map_err(|e| {
                 MigratableError::CompleteMigration(anyhow!(
                     "Error killing vhost-user thread: {e:?}"

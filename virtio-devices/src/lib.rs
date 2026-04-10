@@ -42,8 +42,8 @@ pub use self::balloon::Balloon;
 pub use self::block::{Block, BlockState};
 pub use self::console::{Console, ConsoleResizer, Endpoint};
 pub use self::device::{
-    DmaRemapping, VirtioCommon, VirtioDevice, VirtioInterrupt, VirtioInterruptType,
-    VirtioSharedMemoryList,
+    ActivationContext, DmaRemapping, VirtioCommon, VirtioDevice, VirtioInterrupt,
+    VirtioInterruptType, VirtioSharedMemoryList,
 };
 pub use self::epoll_helper::{
     EPOLL_HELPER_EVENT_LAST, EpollHelper, EpollHelperError, EpollHelperHandler,
@@ -66,12 +66,13 @@ const DEVICE_ACKNOWLEDGE: u32 = 0x01;
 const DEVICE_DRIVER: u32 = 0x02;
 const DEVICE_DRIVER_OK: u32 = 0x04;
 const DEVICE_FEATURES_OK: u32 = 0x08;
+const DEVICE_NEEDS_RESET: u32 = 0x40;
 const DEVICE_FAILED: u32 = 0x80;
 
 const VIRTIO_F_RING_INDIRECT_DESC: u32 = 28;
 const VIRTIO_F_RING_EVENT_IDX: u32 = 29;
 const VIRTIO_F_VERSION_1: u32 = 32;
-const VIRTIO_F_IOMMU_PLATFORM: u32 = 33;
+const VIRTIO_F_ACCESS_PLATFORM: u32 = 33;
 const VIRTIO_F_IN_ORDER: u32 = 35;
 const VIRTIO_F_ORDER_PLATFORM: u32 = 36;
 #[allow(dead_code)]
@@ -167,9 +168,7 @@ pub fn get_host_address_range<M: GuestMemory + ?Sized>(
     if mem.check_range(addr, size) {
         let slice = mem.get_slice(addr, size).unwrap();
         assert!(slice.len() >= size);
-        // TODO: return a VolatileSlice and fix all callers.
-        #[allow(deprecated)]
-        Some(slice.as_ptr())
+        Some(slice.ptr_guard_mut().as_ptr())
     } else {
         None
     }

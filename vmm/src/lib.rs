@@ -6,18 +6,18 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write, stdout};
-use std::net::{TcpListener, TcpStream};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::panic::AssertUnwindSafe;
+#[cfg(feature = "guest_debug")]
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvError, SendError, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 #[cfg(not(target_arch = "riscv64"))]
 use std::time::Instant;
 use std::{io, result, thread};
 
-use anyhow::anyhow;
+use anyhow::{Context, anyhow};
 #[cfg(feature = "dbus_api")]
 use api::dbus::{DBusApiOptions, DBusApiShutdownChannels};
 use api::http::HttpApiHandle;
@@ -27,7 +27,7 @@ use console_devices::{ConsoleInfo, pre_create_console_devices};
 use event_monitor::event;
 use landlock::LandlockError;
 use libc::{EFD_NONBLOCK, SIGINT, SIGTERM, TCSANOW, tcsetattr, termios};
-use log::{error, info, trace, warn};
+use log::{debug, error, info, trace, warn};
 use memory_manager::MemoryManagerSnapshotData;
 use pci::PciBdf;
 use seccompiler::{SeccompAction, apply_filter};
@@ -36,19 +36,22 @@ use serde::{Deserialize, Serialize};
 use signal_hook::iterator::{Handle, Signals};
 use thiserror::Error;
 use tracer::trace_scoped;
-use vm_memory::bitmap::{AtomicBitmap, BitmapSlice};
-use vm_memory::{ReadVolatile, VolatileMemoryError, VolatileSlice, WriteVolatile};
+use vm_memory::GuestMemoryAtomic;
+use vm_memory::bitmap::AtomicBitmap;
 use vm_migration::protocol::*;
-use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
+use vm_migration::{
+    MemoryMigrationContext, Migratable, MigratableError, Pausable, Snapshot, Snapshottable,
+    Transportable,
+};
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::signal::unblock_signal;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 use crate::api::{
-    ApiRequest, ApiResponse, RequestHandler, VmInfoResponse, VmReceiveMigrationData,
-    VmSendMigrationData, VmmPingResponse,
+    ApiRequest, ApiResponse, RequestHandler, TimeoutStrategy, VmInfoResponse,
+    VmReceiveMigrationData, VmSendMigrationData, VmmPingResponse,
 };
-use crate::config::{RestoreConfig, add_to_config};
+use crate::config::{MemoryRestoreMode, RestoreConfig, add_to_config};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::coredump::GuestDebuggable;
 use crate::landlock::Landlock;
@@ -56,11 +59,14 @@ use crate::memory_manager::MemoryManager;
 #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
 use crate::migration::get_vm_snapshot;
 use crate::migration::{recv_vm_config, recv_vm_state};
+use crate::migration_transport::{
+    ReceiveAdditionalConnections, ReceiveListener, SendAdditionalConnections, SocketStream,
+};
 use crate::seccomp_filters::{Thread, get_seccomp_filter};
 use crate::vm::{Error as VmError, Vm, VmState};
 use crate::vm_config::{
-    DeviceConfig, DiskConfig, FsConfig, NetConfig, PmemConfig, UserDeviceConfig, VdpaConfig,
-    VmConfig, VsockConfig,
+    DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, NetConfig, PmemConfig,
+    UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
 };
 
 mod acpi;
@@ -81,10 +87,14 @@ pub mod interrupt;
 pub mod landlock;
 pub mod memory_manager;
 pub mod migration;
+pub mod migration_transport;
 mod pci_segment;
 pub mod seccomp_filters;
 mod serial_manager;
 mod sigwinch_listener;
+mod sync_utils;
+mod uffd;
+mod userfaultfd;
 pub mod vm;
 pub mod vm_config;
 
@@ -221,6 +231,11 @@ impl From<&VmConfig> for hypervisor::HypervisorVmConfig {
             #[cfg(feature = "sev_snp")]
             mem_size: _value.memory.total_size(),
             nested: _value.cpus.nested,
+            smt_enabled: _value
+                .cpus
+                .topology
+                .as_ref()
+                .is_some_and(|t| t.threads_per_core > 1),
         }
     }
 }
@@ -248,89 +263,6 @@ impl From<u64> for EpollDispatch {
             3 => ActivateVirtioDevices,
             4 => Debug,
             _ => Unknown,
-        }
-    }
-}
-
-enum SocketStream {
-    Unix(UnixStream),
-    Tcp(TcpStream),
-}
-
-impl Read for SocketStream {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            SocketStream::Unix(stream) => stream.read(buf),
-            SocketStream::Tcp(stream) => stream.read(buf),
-        }
-    }
-}
-
-impl Write for SocketStream {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        match self {
-            SocketStream::Unix(stream) => stream.write(buf),
-            SocketStream::Tcp(stream) => stream.write(buf),
-        }
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        match self {
-            SocketStream::Unix(stream) => stream.flush(),
-            SocketStream::Tcp(stream) => stream.flush(),
-        }
-    }
-}
-
-impl AsRawFd for SocketStream {
-    fn as_raw_fd(&self) -> RawFd {
-        match self {
-            SocketStream::Unix(s) => s.as_raw_fd(),
-            SocketStream::Tcp(s) => s.as_raw_fd(),
-        }
-    }
-}
-
-impl ReadVolatile for SocketStream {
-    fn read_volatile<B: BitmapSlice>(
-        &mut self,
-        buf: &mut VolatileSlice<B>,
-    ) -> std::result::Result<usize, VolatileMemoryError> {
-        match self {
-            SocketStream::Unix(s) => s.read_volatile(buf),
-            SocketStream::Tcp(s) => s.read_volatile(buf),
-        }
-    }
-
-    fn read_exact_volatile<B: BitmapSlice>(
-        &mut self,
-        buf: &mut VolatileSlice<B>,
-    ) -> std::result::Result<(), VolatileMemoryError> {
-        match self {
-            SocketStream::Unix(s) => s.read_exact_volatile(buf),
-            SocketStream::Tcp(s) => s.read_exact_volatile(buf),
-        }
-    }
-}
-
-impl WriteVolatile for SocketStream {
-    fn write_volatile<B: BitmapSlice>(
-        &mut self,
-        buf: &VolatileSlice<B>,
-    ) -> std::result::Result<usize, VolatileMemoryError> {
-        match self {
-            SocketStream::Unix(s) => s.write_volatile(buf),
-            SocketStream::Tcp(s) => s.write_volatile(buf),
-        }
-    }
-
-    fn write_all_volatile<B: BitmapSlice>(
-        &mut self,
-        buf: &VolatileSlice<B>,
-    ) -> std::result::Result<(), VolatileMemoryError> {
-        match self {
-            SocketStream::Unix(s) => s.write_all_volatile(buf),
-            SocketStream::Tcp(s) => s.write_all_volatile(buf),
         }
     }
 }
@@ -683,6 +615,13 @@ pub struct Vmm {
     console_info: Option<ConsoleInfo>,
 }
 
+/// Just a wrapper for the data that goes into
+/// [`ReceiveMigrationState::Configured`]
+struct ReceiveMigrationConfiguredData {
+    memory_manager: Arc<Mutex<MemoryManager>>,
+    guest_memory: GuestMemoryAtomic<GuestMemoryMmap>,
+    connections: ReceiveAdditionalConnections,
+}
 /// The receiver's state machine behind the migration protocol.
 enum ReceiveMigrationState {
     /// The connection is established and we haven't received any commands yet.
@@ -694,8 +633,13 @@ enum ReceiveMigrationState {
     /// We received file descriptors for memory. This can only happen on UNIX domain sockets.
     MemoryFdsReceived(Vec<(u32, File)>),
 
-    /// We received the VM configuration. We keep the memory configuration around to populate guest memory. From this point on, the sender can start sending memory updates.
-    Configured(Arc<Mutex<MemoryManager>>),
+    /// We received the VM configuration. We keep a direct reference to the guest memory
+    /// around to populate it without having to acquire a lock (which we would have to do
+    /// when accessing the memory through the memory manager).
+    ///
+    /// We keep the memory manager around to pass it into the next state. From this point
+    /// on, the sender can start sending memory updates.
+    Configured(ReceiveMigrationConfiguredData),
 
     /// Memory is populated and we received the state. The VM is ready to go.
     StateReceived,
@@ -730,6 +674,7 @@ impl Vmm {
 
         for signal in signals.forever() {
             match signal {
+                #[allow(clippy::collapsible_match)]
                 SIGTERM | SIGINT => {
                     if exit_evt.write(1).is_err() {
                         // Resetting the terminal is usually done as the VMM exits
@@ -894,6 +839,7 @@ impl Vmm {
     fn vm_receive_migration_step(
         &mut self,
         socket: &mut SocketStream,
+        listener: &ReceiveListener,
         state: ReceiveMigrationState,
         req: &Request,
         _receive_data_migration: &VmReceiveMigrationData,
@@ -909,10 +855,21 @@ impl Vmm {
         let mut configure_vm =
             |socket: &mut SocketStream,
              memory_files: HashMap<u32, File>|
-             -> std::result::Result<Arc<Mutex<MemoryManager>>, MigratableError> {
+             -> std::result::Result<ReceiveMigrationConfiguredData, MigratableError> {
                 let memory_manager = self.vm_receive_config(req, socket, memory_files)?;
-
-                Ok(memory_manager)
+                let guest_memory = memory_manager.lock().unwrap().guest_memory();
+                // Create the additional-connection receiver even in the single-connection case.
+                // At this point the receiver does not know whether the sender will use extra TCP
+                // connections. If it does not, no worker connections are accepted and memory
+                // requests continue to arrive on the main connection.
+                let connections = listener
+                    .try_clone()
+                    .and_then(|l| ReceiveAdditionalConnections::new(l, guest_memory.clone()))?;
+                Ok(ReceiveMigrationConfiguredData {
+                    memory_manager,
+                    guest_memory,
+                    connections,
+                })
             };
 
         let recv_memory_fd = |socket: &mut SocketStream,
@@ -946,13 +903,32 @@ impl Vmm {
                 }
                 _ => invalid_command(),
             },
-            Configured(memory_manager) => match req.command() {
+            Configured(mut config_data) => match req.command() {
+                // Memory commands use the main connection only in the single-connection case.
+                // When multiple TCP connections are configured, the worker connections carry
+                // all memory commands and the main connection is used only for control traffic.
                 Command::Memory => {
-                    self.vm_receive_memory(req, socket, &mut memory_manager.lock().unwrap())?;
-                    Ok(Configured(memory_manager))
+                    migration_transport::receive_memory_ranges(
+                        &config_data.guest_memory,
+                        req,
+                        socket,
+                    )
+                    .inspect_err(|_| {
+                        // connections.cleanup() already logs all errors that occurred in one of the
+                        // threads. Furthermore, this path is only taken in the single-connection case,
+                        // thus we do not expect any errors during this cleanup. The warning should
+                        // reflect that.
+                        if let Err(e) = config_data.connections.cleanup() {
+                            warn!(
+                                "Unexpected error while cleaning up migration connections after a main-connection memory receive failure: {e}"
+                            );
+                        }
+                    })?;
+                    Ok(Configured(config_data))
                 }
                 Command::State => {
-                    self.vm_receive_state(req, socket, memory_manager.clone())?;
+                    config_data.connections.cleanup()?;
+                    self.vm_receive_state(req, socket, config_data.memory_manager)?;
                     Ok(StateReceived)
                 }
                 _ => invalid_command(),
@@ -1126,113 +1102,191 @@ impl Vmm {
         Ok(())
     }
 
-    fn vm_receive_memory<T>(
-        &mut self,
-        req: &Request,
-        socket: &mut T,
-        memory_manager: &mut MemoryManager,
-    ) -> std::result::Result<(), MigratableError>
-    where
-        T: Read + ReadVolatile,
-    {
-        // Read table
-        let table = MemoryRangeTable::read_from(socket, req.length())?;
-
-        // And then read the memory itself
-        memory_manager.receive_memory_regions(&table, socket)?;
-        Ok(())
-    }
-
-    fn socket_url_to_path(url: &str) -> result::Result<PathBuf, MigratableError> {
-        url.strip_prefix("unix:")
-            .ok_or_else(|| {
-                MigratableError::MigrateSend(anyhow!("Could not extract path from URL: {url}"))
-            })
-            .map(|s| s.into())
-    }
-
-    fn send_migration_socket(
-        destination_url: &str,
-    ) -> std::result::Result<SocketStream, MigratableError> {
-        if let Some(address) = destination_url.strip_prefix("tcp:") {
-            info!("Connecting to TCP socket at {address}");
-
-            let socket = TcpStream::connect(address).map_err(|e| {
-                MigratableError::MigrateSend(anyhow!("Error connecting to TCP socket: {e}"))
-            })?;
-
-            Ok(SocketStream::Tcp(socket))
-        } else {
-            let path = Vmm::socket_url_to_path(destination_url)?;
-            info!("Connecting to UNIX socket at {path:?}");
-
-            let socket = UnixStream::connect(&path).map_err(|e| {
-                MigratableError::MigrateSend(anyhow!("Error connecting to UNIX socket: {e}"))
-            })?;
-
-            Ok(SocketStream::Unix(socket))
-        }
-    }
-
-    fn receive_migration_socket(
-        receiver_url: &str,
-    ) -> std::result::Result<SocketStream, MigratableError> {
-        if let Some(address) = receiver_url.strip_prefix("tcp:") {
-            let listener = TcpListener::bind(address).map_err(|e| {
-                MigratableError::MigrateReceive(anyhow!("Error binding to TCP socket: {e}"))
-            })?;
-
-            let (socket, _addr) = listener.accept().map_err(|e| {
-                MigratableError::MigrateReceive(anyhow!(
-                    "Error accepting connection on TCP socket: {e}"
-                ))
-            })?;
-
-            Ok(SocketStream::Tcp(socket))
-        } else {
-            let path = Vmm::socket_url_to_path(receiver_url)?;
-            let listener = UnixListener::bind(&path).map_err(|e| {
-                MigratableError::MigrateReceive(anyhow!("Error binding to UNIX socket: {e}"))
-            })?;
-
-            let (socket, _addr) = listener.accept().map_err(|e| {
-                MigratableError::MigrateReceive(anyhow!(
-                    "Error accepting connection on UNIX socket: {e}"
-                ))
-            })?;
-
-            // Remove the UNIX socket file after accepting the connection
-            std::fs::remove_file(&path).map_err(|e| {
-                MigratableError::MigrateReceive(anyhow!("Error removing UNIX socket file: {e}"))
-            })?;
-
-            Ok(SocketStream::Unix(socket))
-        }
-    }
-
-    // Returns true if there were dirty pages to send
-    fn vm_maybe_send_dirty_pages(
+    /// Performs the initial memory transmission (iteration zero) plus a
+    /// variable number of memory iterations with the goal to eventually migrate
+    /// the VM in a reasonably small downtime.
+    ///
+    /// This returns as soon as the precopy migration indicates it is converged
+    /// (e.g., reasonably small downtime) is reached.
+    fn do_memory_iterations(
         vm: &mut Vm,
         socket: &mut SocketStream,
-    ) -> result::Result<bool, MigratableError> {
-        // Send (dirty) memory table
-        let table = vm.dirty_log()?;
+        ctx: &mut MemoryMigrationContext,
+        is_converged: impl Fn(&MemoryMigrationContext) -> result::Result<bool, MigratableError>,
+        mem_send: &mut SendAdditionalConnections,
+    ) -> result::Result<MemoryRangeTable /* remaining */, MigratableError> {
+        loop {
+            let iteration_begin = Instant::now();
 
-        // But if there are no regions go straight to pause
-        if table.regions().is_empty() {
-            return Ok(false);
+            let iteration_table = if ctx.iteration == 0 {
+                vm.memory_range_table()?
+            } else {
+                // TODO do this in a thread #7816
+                vm.dirty_log()?
+            };
+
+            ctx.update_metrics_before_transfer(iteration_begin, &iteration_table);
+            if is_converged(ctx)? {
+                debug!("Precopy converged: {ctx}");
+                break Ok(iteration_table);
+            }
+
+            // Send the current dirty pages
+            let transfer_begin = Instant::now();
+            mem_send.send_memory(iteration_table, socket)?;
+            let transfer_duration = transfer_begin.elapsed();
+            ctx.update_metrics_after_transfer(transfer_begin, transfer_duration);
+
+            // Log progress of the current iteration
+            debug!("Precopy: {ctx}");
+
+            // Enables management software (e.g., libvirt) to easily track forward progress.
+            event!(
+                "vm",
+                "migration-memory-iteration",
+                "id",
+                ctx.iteration.to_string()
+            );
+
+            // Increment iteration last: This way we ensure that the logging
+            // above matches the actual iteration.
+            ctx.iteration += 1;
+        }
+    }
+
+    /// Checks whether the precopy memory migration has converged and it is safe
+    /// to proceed to the final (paused) memory iteration.
+    ///
+    /// Once this returns, the VM is expected to stop as soon as possible.
+    ///
+    /// Convergence is reached when any of the following criteria is met:
+    ///
+    /// 1. **No dirty pages remain** – the current iteration would transfer zero
+    ///    bytes.
+    /// 2. **Downtime budget is met** – the estimated downtime for the final
+    ///    (paused) iteration is within the caller-specified
+    ///    [`VmSendMigrationData::downtime`] budget.
+    /// 3. **Timeout** – the precopy phase has been running for at least
+    ///    [`VmSendMigrationData::timeout`]. The outcome depends on
+    ///    [`VmSendMigrationData::timeout_strategy`]:
+    ///    - [`TimeoutStrategy::Cancel`] – returns
+    ///    - [`TimeoutStrategy::Ignore`] – the migration completes despite not
+    ///      meeting the downtime budget.
+    ///      [`MigratableError::MigrateSend`] so the caller can abort the
+    ///      migration cleanly.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(true)` – convergence criterion met; the caller should stop precopy
+    ///   iterations.
+    /// * `Ok(false)` – not yet converged; the caller should run another
+    ///   dirty-page iteration.
+    /// * `Err(_)` – the timeout was reached and [`TimeoutStrategy::Cancel`]
+    ///   is in effect.
+    fn is_precopy_converged(
+        ctx: &MemoryMigrationContext,
+        send_data_migration: &VmSendMigrationData,
+    ) -> result::Result<bool, MigratableError> {
+        if ctx.current_iteration_total_bytes == 0 {
+            debug!("Precopy: No more memory to transfer");
+            return Ok(true);
         }
 
-        Request::memory(table.length()).write_to(socket).unwrap();
-        table.write_to(socket)?;
-        // And then the memory itself
-        vm.send_memory_regions(&table, socket)?;
-        Response::read_from(socket)?.ok_or_abandon(
-            socket,
-            MigratableError::MigrateSend(anyhow!("Error during dirty memory migration")),
-        )?;
+        // We currently ignore the time required to transfer the final
+        // VM state (device state and vCPUs) and the time needed on the
+        // receiver to create the VM and initialize its data structures
+        // before execution can resume.
+        //
+        // Manual testing showed that migrating an idle VM on a modern
+        // AMD CPU (CHV release build) adds ~5 ms of overhead when
+        // scaling from 1 to 200 vCPUs. Given this small cost, we
+        // deliberately avoid additional heuristics to estimate the
+        // downtime more precisely - for now. Instead, we approximate
+        // the downtime just by the transfer time of the final memory
+        // delta.
+        if let Some(memory_downtime) = ctx.estimated_downtime
+            && memory_downtime <= send_data_migration.downtime()
+        {
+            debug!(
+                "Precopy: Target downtime can be met: {}ms <= {}ms",
+                memory_downtime.as_millis(),
+                send_data_migration.downtime().as_millis()
+            );
+            return Ok(true);
+        }
 
-        Ok(true)
+        // We check the beginning of the precopy migration and not the overall migration, and
+        // this is fine: precopy takes the longest and the earlier steps are negligible.
+        if ctx.migration_begin.elapsed() >= send_data_migration.timeout() {
+            return match send_data_migration.timeout_strategy {
+                TimeoutStrategy::Cancel => {
+                    let msg = format!(
+                        "Precopy: Timeout reached: {}s: migration didn't converge in time",
+                        send_data_migration.timeout().as_secs()
+                    );
+                    Err(MigratableError::MigrateSend(anyhow!("{msg}")))
+                }
+                TimeoutStrategy::Ignore => {
+                    info!(
+                        "Precopy: Pausing VM, ignoring target downtime ({}ms) due to timeout ({}s): Estimated downtime: {}ms",
+                        send_data_migration.downtime().as_millis(),
+                        send_data_migration.timeout().as_secs(),
+                        ctx.estimated_downtime
+                            .unwrap_or(Duration::from_secs(0))
+                            .as_millis()
+                    );
+                    Ok(true)
+                }
+            };
+        }
+
+        Ok(false)
+    }
+
+    /// Performs the memory migration including multiple iterations.
+    ///
+    /// This includes:
+    /// - initial memory - VM is running
+    /// - multiple memory delta transmissions - VM is running
+    /// - final memory iteration - VM is paused
+    fn do_memory_migration(
+        vm: &mut Vm,
+        socket: &mut SocketStream,
+        send_data_migration: &VmSendMigrationData,
+        mem_send: &mut SendAdditionalConnections,
+    ) -> result::Result<(), MigratableError> {
+        let mut ctx = MemoryMigrationContext::new();
+
+        vm.start_dirty_log()?;
+        let remaining = Self::do_memory_iterations(
+            vm,
+            socket,
+            &mut ctx,
+            // We bind send_data_migration to the callback
+            |ctx| Self::is_precopy_converged(ctx, send_data_migration),
+            mem_send,
+        )?;
+        vm.pause()?;
+
+        // Send last batch of dirty pages: final iteration
+        {
+            let iteration_begin = Instant::now();
+
+            let mut final_table = vm.dirty_log()?;
+            final_table.extend(remaining);
+
+            ctx.update_metrics_before_transfer(iteration_begin, &final_table);
+            let transfer_begin = Instant::now();
+            mem_send.send_memory(final_table, socket)?;
+            let transfer_duration = transfer_begin.elapsed();
+            ctx.update_metrics_after_transfer(transfer_begin, transfer_duration);
+            ctx.iteration += 1;
+        }
+        ctx.finalize();
+
+        info!("Precopy complete: {ctx}");
+
+        Ok(())
     }
 
     fn send_migration(
@@ -1242,12 +1296,13 @@ impl Vmm {
         send_data_migration: &VmSendMigrationData,
     ) -> result::Result<(), MigratableError> {
         // Set up the socket connection
-        let mut socket = Self::send_migration_socket(&send_data_migration.destination_url)?;
+        let mut socket =
+            migration_transport::send_migration_socket(&send_data_migration.destination_url)?;
 
         // Start the migration
-        Request::start().write_to(&mut socket)?;
-        Response::read_from(&mut socket)?.ok_or_abandon(
+        migration_transport::send_request_expect_ok(
             &mut socket,
+            Request::start(),
             MigratableError::MigrateSend(anyhow!("Error starting migration")),
         )?;
 
@@ -1300,15 +1355,7 @@ impl Vmm {
             common_cpuid,
             memory_manager_data: vm.memory_manager_data(),
         };
-        let config_data = serde_json::to_vec(&vm_migration_config).unwrap();
-        Request::config(config_data.len() as u64).write_to(&mut socket)?;
-        socket
-            .write_all(&config_data)
-            .map_err(MigratableError::MigrateSocket)?;
-        Response::read_from(&mut socket)?.ok_or_abandon(
-            &mut socket,
-            MigratableError::MigrateSend(anyhow!("Error during config migration")),
-        )?;
+        migration_transport::send_config(&mut socket, &vm_migration_config)?;
 
         // Let every Migratable object know about the migration being started.
         vm.start_migration()?;
@@ -1317,36 +1364,22 @@ impl Vmm {
             // Now pause VM
             vm.pause()?;
         } else {
-            // Start logging dirty pages
-            vm.start_dirty_log()?;
-
-            // Send memory table
-            let table = vm.memory_range_table()?;
-            Request::memory(table.length())
-                .write_to(&mut socket)
-                .unwrap();
-            table.write_to(&mut socket)?;
-            // And then the memory itself
-            vm.send_memory_regions(&table, &mut socket)?;
-            Response::read_from(&mut socket)?.ok_or_abandon(
-                &mut socket,
-                MigratableError::MigrateSend(anyhow!("Error during dirty memory migration")),
+            let mut mem_send = migration_transport::SendAdditionalConnections::new(
+                &send_data_migration.destination_url,
+                send_data_migration.connections,
+                &vm.guest_memory(),
             )?;
 
-            // Try at most 5 passes of dirty memory sending
-            const MAX_DIRTY_MIGRATIONS: usize = 5;
-            for i in 0..MAX_DIRTY_MIGRATIONS {
-                info!("Dirty memory migration {i} of {MAX_DIRTY_MIGRATIONS}");
-                if !Self::vm_maybe_send_dirty_pages(vm, &mut socket)? {
-                    break;
-                }
-            }
+            Self::do_memory_migration(vm, &mut socket, send_data_migration, &mut mem_send)
+                .inspect_err(|_| {
+                    // Calling cleanup multiple times is fine, thus here we just make sure
+                    // that it is called.
+                    if let Err(e) = mem_send.cleanup() {
+                        warn!("Error cleaning up migration connections: {e}");
+                    }
+                })?;
 
-            // Now pause VM
-            vm.pause()?;
-
-            // Send last batch of dirty pages
-            Self::vm_maybe_send_dirty_pages(vm, &mut socket)?;
+            mem_send.cleanup()?;
         }
 
         // We release the locks early to enable locking them on the destination host.
@@ -1356,20 +1389,12 @@ impl Vmm {
 
         // Capture snapshot and send it
         let vm_snapshot = vm.snapshot()?;
-        let snapshot_data = serde_json::to_vec(&vm_snapshot).unwrap();
-        Request::state(snapshot_data.len() as u64).write_to(&mut socket)?;
-        socket
-            .write_all(&snapshot_data)
-            .map_err(MigratableError::MigrateSocket)?;
-        Response::read_from(&mut socket)?.ok_or_abandon(
-            &mut socket,
-            MigratableError::MigrateSend(anyhow!("Error during state migration")),
-        )?;
+        migration_transport::send_state(&mut socket, &vm_snapshot)?;
         // Complete the migration
         // At this step, the receiving VMM will acquire disk locks again.
-        Request::complete().write_to(&mut socket)?;
-        Response::read_from(&mut socket)?.ok_or_abandon(
+        migration_transport::send_request_expect_ok(
             &mut socket,
+            Request::complete(),
             MigratableError::MigrateSend(anyhow!("Error completing migration")),
         )?;
 
@@ -1430,6 +1455,7 @@ impl Vmm {
         source_url: &str,
         vm_config: Arc<Mutex<VmConfig>>,
         prefault: bool,
+        memory_restore_mode: MemoryRestoreMode,
     ) -> std::result::Result<(), VmError> {
         let snapshot = recv_vm_state(source_url).map_err(VmError::Restore)?;
         #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
@@ -1472,6 +1498,7 @@ impl Vmm {
             Some(&snapshot),
             Some(source_url),
             Some(prefault),
+            Some(memory_restore_mode),
         )?;
         self.vm = Some(vm);
 
@@ -1678,6 +1705,7 @@ impl RequestHandler for Vmm {
                         None,
                         None,
                         None,
+                        None,
                     )?;
 
                     self.vm = Some(vm);
@@ -1762,17 +1790,28 @@ impl RequestHandler for Vmm {
             }
         }
 
-        self.vm_restore(source_url, vm_config, restore_cfg.prefault)
-            .map_err(|vm_restore_err| {
-                error!("VM Restore failed: {vm_restore_err:?}");
+        self.vm_restore(
+            source_url,
+            vm_config,
+            restore_cfg.prefault,
+            restore_cfg.memory_restore_mode,
+        )
+        .and_then(|()| {
+            if restore_cfg.resume {
+                self.vm_resume()
+            } else {
+                Ok(())
+            }
+        })
+        .map_err(|e| {
+            error!("VM Restore failed: {e:?}");
+            if let Err(e) = self.vm_delete() {
+                return e;
+            }
+            e
+        })?;
 
-                // Cleanup the VM being created while vm restore
-                if let Err(e) = self.vm_delete() {
-                    return e;
-                }
-
-                vm_restore_err
-            })
+        Ok(())
     }
 
     #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
@@ -1854,6 +1893,7 @@ impl RequestHandler for Vmm {
             None,
             None,
             None,
+            None,
         )?;
 
         // And we boot it
@@ -1870,14 +1910,16 @@ impl RequestHandler for Vmm {
         match &self.vm_config {
             Some(vm_config) => {
                 let state = match &self.vm {
-                    Some(vm) => vm.get_state()?,
+                    Some(vm) => vm.get_state(),
                     None => VmState::Created,
                 };
                 let config = vm_config.lock().unwrap().clone();
 
-                let mut memory_actual_size = config.memory.total_size();
+                let mut memory_actual_size =
+                    config.memory.total_size() - config.memory.hotplugged_size();
                 if let Some(vm) = &self.vm {
-                    memory_actual_size -= vm.balloon_size();
+                    memory_actual_size = memory_actual_size.saturating_sub(vm.balloon_size());
+                    memory_actual_size += vm.virtio_mem_plugged_size();
                 }
 
                 let device_tree = self
@@ -2120,6 +2162,39 @@ impl RequestHandler for Vmm {
         }
     }
 
+    fn vm_add_generic_vhost_user(
+        &mut self,
+        generic_vhost_user_cfg: GenericVhostUserConfig,
+    ) -> result::Result<Option<Vec<u8>>, VmError> {
+        self.vm_config.as_ref().ok_or(VmError::VmNotCreated)?;
+
+        {
+            // Validate the configuration change in a cloned configuration
+            let mut config = self.vm_config.as_ref().unwrap().lock().unwrap().clone();
+            add_to_config(
+                &mut config.generic_vhost_user,
+                generic_vhost_user_cfg.clone(),
+            );
+            config.validate().map_err(VmError::ConfigValidation)?;
+        }
+
+        if let Some(ref mut vm) = self.vm {
+            let info = vm
+                .add_generic_vhost_user(generic_vhost_user_cfg)
+                .inspect_err(|e| {
+                    error!("Error when adding new generic vhost-user device to the VM: {e:?}");
+                })?;
+            serde_json::to_vec(&info)
+                .map(Some)
+                .map_err(VmError::SerializeJson)
+        } else {
+            // Update VmConfig by adding the new device.
+            let mut config = self.vm_config.as_ref().unwrap().lock().unwrap();
+            add_to_config(&mut config.generic_vhost_user, generic_vhost_user_cfg);
+            Ok(None)
+        }
+    }
+
     fn vm_add_pmem(&mut self, pmem_cfg: PmemConfig) -> result::Result<Option<Vec<u8>>, VmError> {
         self.vm_config.as_ref().ok_or(VmError::VmNotCreated)?;
 
@@ -2263,8 +2338,12 @@ impl RequestHandler for Vmm {
             receive_data_migration.receiver_url
         );
 
+        let mut listener =
+            migration_transport::receive_migration_listener(&receive_data_migration.receiver_url)?;
         // Accept the connection and get the socket
-        let mut socket = Vmm::receive_migration_socket(&receive_data_migration.receiver_url)?;
+        let mut socket = listener.accept()?;
+
+        event!("vm", "migration-receive-started");
 
         let mut state = ReceiveMigrationState::Established;
 
@@ -2274,6 +2353,7 @@ impl RequestHandler for Vmm {
 
             let (response, new_state) = match self.vm_receive_migration_step(
                 &mut socket,
+                &listener,
                 state,
                 &req,
                 &receive_data_migration,
@@ -2295,8 +2375,11 @@ impl RequestHandler for Vmm {
         }
 
         if let ReceiveMigrationState::Aborted = state {
+            event!("vm", "migration-receive-failed");
             self.vm = None;
             self.vm_config = None;
+        } else {
+            event!("vm", "migration-receive-finished");
         }
 
         Ok(())
@@ -2306,9 +2389,18 @@ impl RequestHandler for Vmm {
         &mut self,
         send_data_migration: VmSendMigrationData,
     ) -> result::Result<(), MigratableError> {
+        send_data_migration
+            .validate()
+            .context("Invalid send migration configuration")
+            .map_err(MigratableError::MigrateSend)?;
+
         info!(
-            "Sending migration: destination_url = {}, local = {}",
-            send_data_migration.destination_url, send_data_migration.local
+            "Sending migration: destination_url={},local={},downtime={}ms,timeout={}s,timeout_strategy={:?}",
+            send_data_migration.destination_url,
+            send_data_migration.local,
+            send_data_migration.downtime().as_millis(),
+            send_data_migration.timeout().as_secs(),
+            send_data_migration.timeout_strategy
         );
 
         if !self
@@ -2325,41 +2417,56 @@ impl RequestHandler for Vmm {
             )));
         }
 
-        if let Some(vm) = self.vm.as_mut() {
-            Self::send_migration(
-                vm,
-                #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
-                self.hypervisor.as_ref(),
-                &send_data_migration,
-            )
-            .map_err(|migration_err| {
-                error!("Migration failed: {migration_err:?}");
+        let vm = self
+            .vm
+            .as_mut()
+            .ok_or_else(|| MigratableError::MigrateSend(anyhow!("VM is not running")))?;
 
-                // Stop logging dirty pages only for non-local migrations
-                if !send_data_migration.local
-                    && let Err(e) = vm.stop_dirty_log()
-                {
-                    return e;
-                }
-
-                if vm.get_state().unwrap() == VmState::Paused
-                    && let Err(e) = vm.resume()
-                {
-                    return e;
-                }
-
-                migration_err
-            })?;
-
-            // Shutdown the VM after the migration succeeded
-            self.exit_evt.write(1).map_err(|e| {
-                MigratableError::MigrateSend(anyhow!(
-                    "Failed shutting down the VM after migration: {e:?}"
-                ))
-            })
-        } else {
-            Err(MigratableError::MigrateSend(anyhow!("VM is not running")))
+        // Only running VMs can be migrated: Future work can fix this to allow
+        // also the migration of paused VMs while preserving the state in success
+        // and error case. See #7815.
+        if vm.get_state() != VmState::Running {
+            return Err(MigratableError::MigrateSend(anyhow!(
+                "VM is not in running state: {:?}",
+                vm.get_state()
+            )));
         }
+
+        event!("vm", "migration-started");
+        Self::send_migration(
+            vm,
+            #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+            self.hypervisor.as_ref(),
+            &send_data_migration,
+        )
+        .map_err(|migration_err| {
+            error!("Migration failed: {migration_err:?}");
+            event!("vm", "migration-failed");
+
+            // Stop logging dirty pages only for non-local migrations
+            if !send_data_migration.local
+                && let Err(e) = vm.stop_dirty_log()
+            {
+                return e;
+            }
+
+            if vm.get_state() == VmState::Paused
+                && let Err(e) = vm.resume()
+            {
+                return e;
+            }
+
+            migration_err
+        })?;
+
+        event!("vm", "migration-finished");
+
+        // Shutdown the VM after the migration succeeded
+        self.exit_evt.write(1).map_err(|e| {
+            MigratableError::MigrateSend(anyhow!(
+                "Failed shutting down the VM after migration: {e:?}"
+            ))
+        })
     }
 }
 
@@ -2369,12 +2476,14 @@ const DEVICE_MANAGER_SNAPSHOT_ID: &str = "device-manager";
 
 #[cfg(test)]
 mod unit_tests {
+    use std::path::PathBuf;
+
     use super::*;
     #[cfg(target_arch = "x86_64")]
     use crate::vm_config::DebugConsoleConfig;
     use crate::vm_config::{
-        ConsoleConfig, ConsoleOutputMode, CpuFeatures, CpusConfig, HotplugMethod, MemoryConfig,
-        PayloadConfig, RngConfig,
+        ConsoleConfig, ConsoleOutputMode, CoreScheduling, CpuFeatures, CpusConfig, HotplugMethod,
+        MemoryConfig, PayloadConfig, RngConfig,
     };
 
     fn create_dummy_vmm() -> Vmm {
@@ -2403,6 +2512,7 @@ mod unit_tests {
                 affinity: None,
                 features: CpuFeatures::default(),
                 nested: true,
+                core_scheduling: CoreScheduling::default(),
             },
             memory: MemoryConfig {
                 size: 536_870_912,
@@ -2438,6 +2548,7 @@ mod unit_tests {
             },
             balloon: None,
             fs: None,
+            generic_vhost_user: None,
             pmem: None,
             serial: ConsoleConfig {
                 file: None,
@@ -2671,6 +2782,59 @@ mod unit_tests {
                 .clone()
                 .unwrap()[0],
             fs_config
+        );
+    }
+
+    #[test]
+    fn test_vmm_vm_cold_add_generic_vhost_user() {
+        let mut vmm = create_dummy_vmm();
+        let generic_vhost_user_config =
+            GenericVhostUserConfig::parse("virtio_id=26,socket=/tmp/sock,queue_sizes=[1024]")
+                .unwrap();
+
+        assert!(matches!(
+            vmm.vm_add_generic_vhost_user(generic_vhost_user_config.clone()),
+            Err(VmError::VmNotCreated)
+        ));
+
+        let _ = vmm.vm_create(create_dummy_vm_config());
+        assert!(
+            vmm.vm_config
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .generic_vhost_user
+                .is_none()
+        );
+
+        assert!(
+            vmm.vm_add_generic_vhost_user(generic_vhost_user_config.clone())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            vmm.vm_config
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .generic_vhost_user
+                .clone()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            vmm.vm_config
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .generic_vhost_user
+                .clone()
+                .unwrap()[0],
+            generic_vhost_user_config
         );
     }
 

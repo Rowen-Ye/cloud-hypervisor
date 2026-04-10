@@ -5,7 +5,6 @@
 
 // Performance tests
 
-use std::path::PathBuf;
 use std::time::Duration;
 use std::{fs, thread};
 
@@ -14,8 +13,6 @@ use thiserror::Error;
 
 use crate::{ImageFormat, PerformanceTestControl, PerformanceTestOverrides, mean};
 
-#[cfg(target_arch = "x86_64")]
-pub const FOCAL_IMAGE_NAME: &str = "focal-server-cloudimg-amd64-custom-20210609-0.raw";
 #[cfg(target_arch = "aarch64")]
 pub const FOCAL_IMAGE_NAME: &str = "focal-server-cloudimg-arm64-custom-20210929-0-update-tool.raw";
 
@@ -37,6 +34,9 @@ const QCOW2_BACKING_FILE: &str = "/var/tmp/ch-blk-io-test-qcow2-backing.qcow2";
 pub const OVERLAY_WITH_QCOW2_BACKING: &str = "/var/tmp/ch-blk-io-test-overlay-qcow2.qcow2";
 const RAW_BACKING_FILE: &str = "/var/tmp/ch-blk-io-test-raw-backing.raw";
 pub const OVERLAY_WITH_RAW_BACKING: &str = "/var/tmp/ch-blk-io-test-overlay-raw.qcow2";
+pub const QCOW2_UNCOMPRESSED_IMG: &str = "/var/tmp/ch-blk-io-test-uncompressed.qcow2";
+pub const QCOW2_ZLIB_IMG: &str = "/var/tmp/ch-blk-io-test-zlib.qcow2";
+pub const QCOW2_ZSTD_IMG: &str = "/var/tmp/ch-blk-io-test-zstd.qcow2";
 
 pub fn init_tests(overrides: &PerformanceTestOverrides) {
     let mut cmd = format!("dd if=/dev/zero of={BLK_IO_TEST_IMG} bs=1M count=4096");
@@ -78,6 +78,22 @@ pub fn init_tests(overrides: &PerformanceTestOverrides) {
         "qemu-img create -f qcow2 -b {RAW_BACKING_FILE} -F raw {OVERLAY_WITH_RAW_BACKING} 4G"
     );
     assert!(exec_host_command_output(&cmd).status.success());
+
+    // Standalone QCOW2 image with no backing file
+    cmd = format!("qemu-img create -f qcow2 -o preallocation=full {QCOW2_UNCOMPRESSED_IMG} 4G");
+    assert!(exec_host_command_output(&cmd).status.success());
+
+    // Zlib compressed QCOW2 image, convert populates actual compressed clusters
+    cmd = format!(
+        "qemu-img convert -f qcow2 -O qcow2 -c -o compression_type=zlib {QCOW2_UNCOMPRESSED_IMG} {QCOW2_ZLIB_IMG}"
+    );
+    assert!(exec_host_command_output(&cmd).status.success());
+
+    // Zstd compressed QCOW2 image, convert populates actual compressed clusters
+    cmd = format!(
+        "qemu-img convert -f qcow2 -O qcow2 -c -o compression_type=zstd {QCOW2_UNCOMPRESSED_IMG} {QCOW2_ZSTD_IMG}"
+    );
+    assert!(exec_host_command_output(&cmd).status.success());
 }
 
 pub fn cleanup_tests() {
@@ -91,6 +107,12 @@ pub fn cleanup_tests() {
         .unwrap_or_else(|_| panic!("Failed to remove file '{RAW_BACKING_FILE}'."));
     fs::remove_file(OVERLAY_WITH_RAW_BACKING)
         .unwrap_or_else(|_| panic!("Failed to remove file '{OVERLAY_WITH_RAW_BACKING}'."));
+    fs::remove_file(QCOW2_UNCOMPRESSED_IMG)
+        .unwrap_or_else(|_| panic!("Failed to remove file '{QCOW2_UNCOMPRESSED_IMG}'."));
+    fs::remove_file(QCOW2_ZLIB_IMG)
+        .unwrap_or_else(|_| panic!("Failed to remove file '{QCOW2_ZLIB_IMG}'."));
+    fs::remove_file(QCOW2_ZSTD_IMG)
+        .unwrap_or_else(|_| panic!("Failed to remove file '{QCOW2_ZSTD_IMG}'."));
 }
 
 // Performance tests are expected to be executed sequentially, so we can
@@ -100,45 +122,6 @@ pub fn cleanup_tests() {
 // performance tests dozens times in a single run.
 fn performance_test_new_guest(disk_config: Box<dyn DiskConfig>) -> Guest {
     Guest::new_from_ip_range(disk_config, "172.19", 0)
-}
-
-const DIRECT_KERNEL_BOOT_CMDLINE: &str =
-    "root=/dev/vda1 console=hvc0 rw systemd.journald.forward_to_console=1";
-
-// Creates the path for direct kernel boot and return the path.
-// For x86_64, this function returns the vmlinux kernel path.
-// For AArch64, this function returns the PE kernel path.
-fn direct_kernel_boot_path() -> PathBuf {
-    let mut workload_path = dirs::home_dir().unwrap();
-    workload_path.push("workloads");
-
-    let mut kernel_path = workload_path;
-    #[cfg(target_arch = "x86_64")]
-    kernel_path.push("vmlinux-x86_64");
-    #[cfg(target_arch = "aarch64")]
-    kernel_path.push("Image-arm64");
-
-    kernel_path
-}
-
-fn remote_command(api_socket: &str, command: &str, arg: Option<&str>) -> bool {
-    let mut cmd = std::process::Command::new(clh_command("ch-remote"));
-    cmd.args([&format!("--api-socket={api_socket}"), command]);
-
-    if let Some(arg) = arg {
-        cmd.arg(arg);
-    }
-    let output = cmd.output().unwrap();
-    if output.status.success() {
-        true
-    } else {
-        eprintln!(
-            "Error running ch-remote command: {:?}\nstderr: {}",
-            &cmd,
-            String::from_utf8_lossy(&output.stderr)
-        );
-        false
-    }
 }
 
 pub fn performance_net_throughput(control: &PerformanceTestControl) -> f64 {
@@ -169,7 +152,7 @@ pub fn performance_net_throughput(control: &PerformanceTestControl) -> f64 {
         .unwrap();
 
     let r = std::panic::catch_unwind(|| {
-        guest.wait_vm_boot(None).unwrap();
+        guest.wait_vm_boot().unwrap();
         measure_virtio_net_throughput(test_timeout, num_queues / 2, &guest, rx, bandwidth).unwrap()
     });
 
@@ -210,7 +193,7 @@ pub fn performance_net_latency(control: &PerformanceTestControl) -> f64 {
         .unwrap();
 
     let r = std::panic::catch_unwind(|| {
-        guest.wait_vm_boot(None).unwrap();
+        guest.wait_vm_boot().unwrap();
 
         // 'ethr' tool will measure the latency multiple times with provided test time
         let latency = measure_virtio_net_latency(&guest, control.test_timeout).unwrap();
@@ -413,6 +396,22 @@ pub fn performance_block_io(control: &PerformanceTestControl) -> f64 {
         .unwrap()
         .to_string();
 
+    let mut test_disk_arg =
+        format!("path={test_file},queue_size={queue_size},num_queues={num_queues}");
+    if test_file == OVERLAY_WITH_QCOW2_BACKING
+        || test_file == OVERLAY_WITH_RAW_BACKING
+        || test_file == QCOW2_UNCOMPRESSED_IMG
+        || test_file == QCOW2_ZLIB_IMG
+        || test_file == QCOW2_ZSTD_IMG
+    {
+        test_disk_arg.push_str(",image_type=qcow2");
+        if test_file == OVERLAY_WITH_QCOW2_BACKING || test_file == OVERLAY_WITH_RAW_BACKING {
+            test_disk_arg.push_str(",backing_files=on");
+        }
+    } else if test_file == BLK_IO_TEST_IMG {
+        test_disk_arg.push_str(",image_type=raw");
+    }
+
     let mut child = GuestCommand::new(&guest)
         .args(["--cpus", &format!("boot={num_queues}")])
         .args(["--memory", "size=4G"])
@@ -430,7 +429,7 @@ pub fn performance_block_io(control: &PerformanceTestControl) -> f64 {
                 guest.disk_config.disk(DiskType::CloudInit).unwrap()
             )
             .as_str(),
-            format!("path={test_file},queue_size={queue_size},num_queues={num_queues}").as_str(),
+            test_disk_arg.as_str(),
         ])
         .default_net()
         .args(["--api-socket", &api_socket])
@@ -441,7 +440,7 @@ pub fn performance_block_io(control: &PerformanceTestControl) -> f64 {
         .unwrap();
 
     let r = std::panic::catch_unwind(|| {
-        guest.wait_vm_boot(None).unwrap();
+        guest.wait_vm_boot().unwrap();
 
         let fio_command = format!(
             "sudo fio --filename=/dev/vdc --name=test --output-format=json \

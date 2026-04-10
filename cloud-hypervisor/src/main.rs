@@ -32,9 +32,9 @@ use vmm::vm_config::FwCfgConfig;
 #[cfg(feature = "ivshmem")]
 use vmm::vm_config::IvshmemConfig;
 use vmm::vm_config::{
-    BalloonConfig, DeviceConfig, DiskConfig, FsConfig, LandlockConfig, NetConfig, NumaConfig,
-    PciSegmentConfig, PmemConfig, RateLimiterGroupConfig, TpmConfig, UserDeviceConfig, VdpaConfig,
-    VmConfig, VsockConfig,
+    BalloonConfig, DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, LandlockConfig,
+    NetConfig, NumaConfig, PciSegmentConfig, PmemConfig, RateLimiterGroupConfig, TpmConfig,
+    UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
 };
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::signal::block_signal;
@@ -199,11 +199,10 @@ fn get_cli_options_sorted(
             .long("cmdline")
             .help("Kernel command line")
             .num_args(1)
-            .group("vm-config"), Arg::new("console")
+            .group("vm-config"),
+        Arg::new("console")
             .long("console")
-            .help(
-                "Control (virtio) console: \"off|null|pty|tty|file=</path/to/a/file>,iommu=on|off\"",
-            )
+            .help("Control (virtio) console: \"off|null|pty|tty|file=</path/to/a/file>,iommu=on|off\"")
             .default_value("tty")
             .group("vm-config"),
         Arg::new("cpus")
@@ -214,7 +213,7 @@ fn get_cli_options_sorted(
                     kvm_hyperv=on|off,max_phys_bits=<maximum_number_of_physical_bits>,\
                     affinity=<list_of_vcpus_with_their_associated_cpuset>,\
                     features=<list_of_features_to_enable>,\
-                    nested=on|off",
+                    nested=on|off,core_scheduling=vm|vcpu|off",
             )
             .default_value(default_vcpus)
             .group("vm-config"),
@@ -247,11 +246,13 @@ fn get_cli_options_sorted(
             .long("device")
             .help(DeviceConfig::SYNTAX)
             .num_args(1..)
+            .action(ArgAction::Append)
             .group("vm-config"),
         Arg::new("disk")
             .long("disk")
             .help(DiskConfig::SYNTAX)
             .num_args(1..)
+            .action(ArgAction::Append)
             .group("vm-config"),
         Arg::new("event-monitor")
             .long("event-monitor")
@@ -267,6 +268,7 @@ fn get_cli_options_sorted(
             .long("fs")
             .help(FsConfig::SYNTAX)
             .num_args(1..)
+            .action(ArgAction::Append)
             .group("vm-config"),
         #[cfg(feature = "fw_cfg")]
         Arg::new("fw-cfg-config")
@@ -280,6 +282,12 @@ fn get_cli_options_sorted(
             .help("GDB socket (UNIX domain socket): path=</path/to/a/file>")
             .num_args(1)
             .group("vmm-config"),
+        Arg::new("generic-vhost-user")
+            .long("generic-vhost-user")
+            .help(GenericVhostUserConfig::SYNTAX)
+            .num_args(1..)
+            .action(ArgAction::Append)
+            .group("vm-config"),
         #[cfg(feature = "igvm")]
         Arg::new("igvm")
             .long("igvm")
@@ -324,6 +332,7 @@ fn get_cli_options_sorted(
             .long("landlock-rules")
             .help(LandlockConfig::SYNTAX)
             .num_args(1..)
+            .action(ArgAction::Append)
             .group("vm-config"),
         Arg::new("log-file")
             .long("log-file")
@@ -356,21 +365,25 @@ fn get_cli_options_sorted(
                      prefault=on|off\"",
             )
             .num_args(1..)
+            .action(ArgAction::Append)
             .group("vm-config"),
         Arg::new("net")
             .long("net")
             .help(NetConfig::SYNTAX)
             .num_args(1..)
+            .action(ArgAction::Append)
             .group("vm-config"),
         Arg::new("numa")
             .long("numa")
             .help(NumaConfig::SYNTAX)
             .num_args(1..)
+            .action(ArgAction::Append)
             .group("vm-config"),
         Arg::new("pci-segment")
             .long("pci-segment")
             .help(PciSegmentConfig::SYNTAX)
             .num_args(1..)
+            .action(ArgAction::Append)
             .group("vm-config"),
         Arg::new("platform")
             .long("platform")
@@ -383,6 +396,7 @@ fn get_cli_options_sorted(
             .long("pmem")
             .help(PmemConfig::SYNTAX)
             .num_args(1..)
+            .action(ArgAction::Append)
             .group("vm-config"),
         #[cfg(feature = "pvmemcontrol")]
         Arg::new("pvmemcontrol")
@@ -401,6 +415,7 @@ fn get_cli_options_sorted(
             .long("rate-limit-group")
             .help(RateLimiterGroupConfig::SYNTAX)
             .num_args(1..)
+            .action(ArgAction::Append)
             .group("vm-config"),
         Arg::new("restore")
             .long("restore")
@@ -433,6 +448,7 @@ fn get_cli_options_sorted(
             .long("user-device")
             .help(UserDeviceConfig::SYNTAX)
             .num_args(1..)
+            .action(ArgAction::Append)
             .group("vm-config"),
         Arg::new("v")
             .short('v')
@@ -443,6 +459,7 @@ fn get_cli_options_sorted(
             .long("vdpa")
             .help(VdpaConfig::SYNTAX)
             .num_args(1..)
+            .action(ArgAction::Append)
             .group("vm-config"),
         Arg::new("version")
             .short('V')
@@ -589,6 +606,8 @@ fn start_vmm(cmd_arguments: &ArgMatches) -> Result<Option<String>, Error> {
             error!("Error blocking signals: {e}");
         }
     }
+
+    info!("{} starting", env!("BUILD_VERSION"));
 
     let hypervisor = hypervisor::new().map_err(Error::CreateHypervisor)?;
 
@@ -911,8 +930,8 @@ mod unit_tests {
     #[cfg(target_arch = "x86_64")]
     use vmm::vm_config::DebugConsoleConfig;
     use vmm::vm_config::{
-        ConsoleConfig, ConsoleOutputMode, CpuFeatures, CpusConfig, HotplugMethod, MemoryConfig,
-        PayloadConfig, RngConfig, VmConfig,
+        ConsoleConfig, ConsoleOutputMode, CoreScheduling, CpuFeatures, CpusConfig, HotplugMethod,
+        MemoryConfig, PayloadConfig, RngConfig, VmConfig,
     };
 
     use crate::test_util::assert_args_sorted;
@@ -963,6 +982,7 @@ mod unit_tests {
                 affinity: None,
                 features: CpuFeatures::default(),
                 nested: true,
+                core_scheduling: CoreScheduling::Vm,
             },
             memory: MemoryConfig {
                 size: 536_870_912,
@@ -998,6 +1018,7 @@ mod unit_tests {
             },
             balloon: None,
             fs: None,
+            generic_vhost_user: None,
             pmem: None,
             serial: ConsoleConfig {
                 file: None,
@@ -1199,14 +1220,14 @@ mod unit_tests {
                     "--kernel",
                     "/path/to/kernel",
                     "--disk",
-                    "path=/path/to/disk/1",
+                    "path=/path/to/disk/1,image_type=raw",
                     "path=/path/to/disk/2",
                 ],
                 r#"{
                     "payload": {"kernel": "/path/to/kernel"},
                     "disks": [
-                        {"path": "/path/to/disk/1"},
-                        {"path": "/path/to/disk/2"}
+                        {"path": "/path/to/disk/1", "image_type": "Raw"},
+                        {"path": "/path/to/disk/2", "image_type": "Unknown"}
                     ]
                 }"#,
                 true,
@@ -1217,8 +1238,8 @@ mod unit_tests {
                     "--kernel",
                     "/path/to/kernel",
                     "--disk",
-                    "path=/path/to/disk/1",
-                    "path=/path/to/disk/2",
+                    "path=/path/to/disk/1,image_type=raw",
+                    "path=/path/to/disk/2,image_type=qcow2",
                 ],
                 r#"{
                     "payload": {"kernel": "/path/to/kernel"},
@@ -1280,8 +1301,8 @@ mod unit_tests {
                 r#"{
                     "payload": {"kernel": "/path/to/kernel"},
                     "disks": [
-                        {"path": "/path/to/disk/1", "rate_limit_group": "group0"},
-                        {"path": "/path/to/disk/2", "rate_limit_group": "group0"}
+                        {"path": "/path/to/disk/1", "rate_limit_group": "group0", "image_type": "Unknown"},
+                        {"path": "/path/to/disk/2", "rate_limit_group": "group0", "image_type": "Unknown"}
                     ],
                     "rate_limit_groups": [
                         {"id": "group0", "rate_limiter_config": {"bandwidth": {"size": 1000, "one_time_burst": 0, "refill_time": 100}}}

@@ -24,6 +24,7 @@ pub enum Thread {
     VirtioRng,
     VirtioVhostBlock,
     VirtioVhostFs,
+    VirtioGenericVhostUser,
     VirtioVhostNet,
     VirtioVhostNetCtl,
     VirtioVsock,
@@ -145,11 +146,11 @@ fn virtio_mem_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
 
 fn virtio_net_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
     vec![
+        #[cfg(feature = "sev_snp")]
+        (libc::SYS_ioctl, create_mshv_sev_snp_ioctl_seccomp_rule()),
         (libc::SYS_readv, vec![]),
         (libc::SYS_timerfd_settime, vec![]),
         (libc::SYS_writev, vec![]),
-        #[cfg(feature = "sev_snp")]
-        (libc::SYS_ioctl, create_mshv_sev_snp_ioctl_seccomp_rule()),
     ]
 }
 
@@ -179,6 +180,20 @@ fn virtio_rng_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
 }
 
 fn virtio_vhost_fs_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
+    vec![
+        (libc::SYS_clock_nanosleep, vec![]),
+        (libc::SYS_connect, vec![]),
+        (libc::SYS_nanosleep, vec![]),
+        (libc::SYS_pread64, vec![]),
+        (libc::SYS_pwrite64, vec![]),
+        (libc::SYS_recvmsg, vec![]),
+        (libc::SYS_sendmsg, vec![]),
+        (libc::SYS_sendto, vec![]),
+        (libc::SYS_socket, vec![]),
+    ]
+}
+
+fn virtio_generic_vhost_user_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
     vec![
         (libc::SYS_clock_nanosleep, vec![]),
         (libc::SYS_connect, vec![]),
@@ -239,14 +254,11 @@ fn virtio_vsock_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
     vec![
         (libc::SYS_accept4, vec![]),
         (libc::SYS_connect, vec![]),
+        (libc::SYS_fcntl, vec![]),
         (libc::SYS_ioctl, create_vsock_ioctl_seccomp_rule()),
         (libc::SYS_recvfrom, vec![]),
         (libc::SYS_sendto, vec![]),
         (libc::SYS_socket, vec![]),
-        // If debug_assertions is enabled, closing a file first checks
-        // whether the FD is valid with fcntl.
-        #[cfg(debug_assertions)]
-        (libc::SYS_fcntl, vec![]),
     ]
 }
 
@@ -271,6 +283,7 @@ fn get_seccomp_rules(thread_type: Thread) -> Vec<(i64, Vec<SeccompRule>)> {
         Thread::VirtioRng => virtio_rng_thread_rules(),
         Thread::VirtioVhostBlock => virtio_vhost_block_thread_rules(),
         Thread::VirtioVhostFs => virtio_vhost_fs_thread_rules(),
+        Thread::VirtioGenericVhostUser => virtio_generic_vhost_user_thread_rules(),
         Thread::VirtioVhostNet => virtio_vhost_net_thread_rules(),
         Thread::VirtioVhostNetCtl => virtio_vhost_net_ctl_thread_rules(),
         Thread::VirtioVsock => virtio_vsock_thread_rules(),
@@ -292,6 +305,7 @@ fn virtio_thread_common() -> Vec<(i64, Vec<SeccompRule>)> {
         #[cfg(target_arch = "x86_64")]
         (libc::SYS_epoll_wait, vec![]),
         (libc::SYS_exit, vec![]),
+        (libc::SYS_fcntl, vec![]),
         (libc::SYS_futex, vec![]),
         (libc::SYS_gettid, vec![]),
         (libc::SYS_madvise, vec![]),
@@ -305,8 +319,6 @@ fn virtio_thread_common() -> Vec<(i64, Vec<SeccompRule>)> {
         (libc::SYS_rt_sigreturn, vec![]),
         (libc::SYS_sigaltstack, vec![]),
         (libc::SYS_write, vec![]),
-        #[cfg(debug_assertions)]
-        (libc::SYS_fcntl, vec![]),
     ]
 }
 

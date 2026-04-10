@@ -18,6 +18,7 @@ use std::str::FromStr;
 use std::time::Duration;
 use std::{env, fmt, fs, io, thread};
 
+use rand::Rng;
 use serde_json::Value;
 use ssh2::Session;
 use thiserror::Error;
@@ -74,7 +75,8 @@ pub struct GuestNetworkConfig {
 
 pub const DEFAULT_TCP_LISTENER_MESSAGE: &str = "booted";
 pub const DEFAULT_TCP_LISTENER_PORT: u16 = 8000;
-pub const DEFAULT_TCP_LISTENER_TIMEOUT: i32 = 120;
+pub const DEFAULT_TCP_LISTENER_TIMEOUT: u32 = 120;
+pub const DEFAULT_CVM_TCP_LISTENER_TIMEOUT: u32 = 140;
 
 #[derive(Error, Debug)]
 pub enum WaitForBootError {
@@ -91,16 +93,12 @@ pub enum WaitForBootError {
 }
 
 impl GuestNetworkConfig {
-    pub fn wait_vm_boot(&self, custom_timeout: Option<i32>) -> Result<(), WaitForBootError> {
+    pub fn wait_vm_boot(&self, custom_timeout: u32) -> Result<(), WaitForBootError> {
         let start = std::time::Instant::now();
         // The 'port' is unique per 'GUEST' and listening to wild-card ip avoids retrying on 'TcpListener::bind()'
         let listen_addr = format!("0.0.0.0:{}", self.tcp_listener_port);
         let expected_guest_addr = self.guest_ip0.as_str();
         let mut s = String::new();
-        let timeout = match custom_timeout {
-            Some(t) => t,
-            None => DEFAULT_TCP_LISTENER_TIMEOUT,
-        };
 
         let mut closure = || -> Result<(), WaitForBootError> {
             let listener =
@@ -122,7 +120,11 @@ impl GuestNetworkConfig {
             .expect("Cannot add 'tcp_listener' event to epoll");
             let mut events = [epoll::Event::new(epoll::Events::empty(), 0); 1];
             loop {
-                let num_events = match epoll::wait(epoll_fd, timeout * 1000_i32, &mut events[..]) {
+                let num_events = match epoll::wait(
+                    epoll_fd,
+                    (custom_timeout * 1000).try_into().unwrap(),
+                    &mut events[..],
+                ) {
                     Ok(num_events) => Ok(num_events),
                     Err(e) => match e.raw_os_error() {
                         Some(libc::EAGAIN) | Some(libc::EINTR) => continue,
@@ -162,7 +164,7 @@ impl GuestNetworkConfig {
                 let duration = start.elapsed();
                 eprintln!(
                     "\n\n==== Start 'wait_vm_boot' (FAILED) ==== \
-                    \n\nduration =\"{duration:?}, timeout = {timeout}s\" \
+                    \n\nduration =\"{duration:?}, timeout = {custom_timeout}s\" \
                     \nlisten_addr=\"{listen_addr}\" \
                     \nexpected_guest_addr=\"{expected_guest_addr}\" \
                     \nmessage=\"{s}\" \
@@ -881,12 +883,42 @@ pub fn kill_child(child: &mut Child) {
     }
 }
 
+#[derive(Debug)]
+pub struct MetaEvent {
+    pub event: String,
+    pub device_id: Option<String>,
+}
+
+impl MetaEvent {
+    pub fn match_with_json_event(&self, v: &serde_json::Value) -> bool {
+        let mut matched = false;
+        if v["event"].as_str().unwrap() == self.event {
+            if let Some(device_id) = &self.device_id {
+                if v["properties"]["id"].as_str().unwrap() == device_id {
+                    matched = true;
+                }
+            } else {
+                matched = true;
+            }
+        }
+        matched
+    }
+}
+
 pub const PIPE_SIZE: i32 = 32 << 20;
 
 pub struct Guest {
     pub tmp_dir: TempDir,
     pub disk_config: Box<dyn DiskConfig>,
     pub network: GuestNetworkConfig,
+    pub vm_type: GuestVmType,
+    pub boot_timeout: u32,
+    pub kernel_path: Option<String>,
+    pub kernel_cmdline: Option<String>,
+    pub console_type: Option<String>,
+    pub num_cpu: u32,
+    pub nested: bool,
+    pub mem_size_str: String,
 }
 
 // Return the next id that can be used for this guest. This is stored in a
@@ -951,11 +983,44 @@ impl Guest {
             tmp_dir,
             disk_config,
             network,
+            vm_type: GuestVmType::Regular,
+            boot_timeout: DEFAULT_TCP_LISTENER_TIMEOUT,
+            kernel_path: direct_kernel_boot_path().to_str().map(String::from),
+            kernel_cmdline: Some(DIRECT_KERNEL_BOOT_CMDLINE.to_string()),
+            console_type: None,
+            num_cpu: 1u32,
+            nested: true,
+            mem_size_str: "512M".to_string(),
         }
     }
 
     pub fn new(disk_config: Box<dyn DiskConfig>) -> Self {
         Self::new_from_ip_range(disk_config, "192.168", next_guest_id())
+    }
+
+    pub fn with_cpu(mut self, count: u32) -> Self {
+        self.num_cpu = count;
+        self
+    }
+
+    pub fn with_memory(mut self, mem_size: &str) -> Self {
+        self.mem_size_str = mem_size.to_string();
+        self
+    }
+
+    pub fn with_nested(mut self, nested: bool) -> Self {
+        self.nested = nested;
+        self
+    }
+
+    pub fn with_kernel_path(mut self, kernel_path: &str) -> Self {
+        self.kernel_path = Some(kernel_path.to_string());
+        self
+    }
+
+    pub fn with_kernel(mut self, kernel: String) -> Self {
+        self.kernel_path = Some(kernel);
+        self
     }
 
     pub fn default_net_string(&self) -> String {
@@ -1028,17 +1093,51 @@ impl Guest {
         )
     }
 
-    pub fn api_create_body(&self, cpu_count: u8, kernel_path: &str, kernel_cmd: &str) -> String {
-        format! {"{{\"cpus\":{{\"boot_vcpus\":{},\"max_vcpus\":{}}},\"payload\":{{\"kernel\":\"{}\",\"cmdline\": \"{}\"}},\"net\":[{{\"ip\":\"{}\", \"mask\":\"255.255.255.0\", \"mac\":\"{}\"}}], \"disks\":[{{\"path\":\"{}\"}}, {{\"path\":\"{}\"}}]}}",
-                 cpu_count,
-                 cpu_count,
-                 kernel_path,
-                 kernel_cmd,
-                 self.network.host_ip0,
-                 self.network.guest_mac0,
-                 self.disk_config.disk(DiskType::OperatingSystem).unwrap().as_str(),
-                 self.disk_config.disk(DiskType::CloudInit).unwrap().as_str(),
+    pub fn api_create_body(&self) -> String {
+        let mut body = serde_json::json!({
+            "cpus": {
+            "boot_vcpus": self.num_cpu,
+            "max_vcpus": self.num_cpu,
+            },
+            "net": [
+            {
+                "ip": self.network.host_ip0,
+                "mask": "255.255.255.0",
+                "mac": self.network.guest_mac0,
+            }
+            ],
+            "disks": [
+            {
+                "path": self.disk_config.disk(DiskType::OperatingSystem).unwrap(),
+            },
+            {
+                "path": self.disk_config.disk(DiskType::CloudInit).unwrap(),
+            }
+            ]
+        });
+
+        if !self.nested {
+            body["cpus"]["nested"] = serde_json::json!(false);
         }
+
+        if self.vm_type == GuestVmType::Confidential {
+            body["platform"] = serde_json::json!({"sev_snp": true});
+            body["payload"] = serde_json::json!({
+            "igvm": direct_igvm_boot_path(Some("hvc0"))
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "cmdline": self.kernel_cmdline.as_deref().unwrap(),
+            "host_data": generate_host_data(),
+            });
+        } else {
+            body["payload"] = serde_json::json!({
+            "kernel": self.kernel_path.as_deref().unwrap(),
+            "cmdline": self.kernel_cmdline.as_deref().unwrap(),
+            });
+        }
+
+        body.to_string()
     }
 
     pub fn get_cpu_count(&self) -> Result<u32, Error> {
@@ -1076,7 +1175,17 @@ impl Guest {
         .map_err(Error::Parsing)
     }
 
-    pub fn wait_vm_boot(&self, custom_timeout: Option<i32>) -> Result<(), Error> {
+    fn default_boot_timeout(&self) -> u32 {
+        self.boot_timeout
+    }
+
+    pub fn wait_vm_boot(&self) -> Result<(), Error> {
+        self.network
+            .wait_vm_boot(self.default_boot_timeout())
+            .map_err(Error::WaitForBoot)
+    }
+
+    pub fn wait_vm_boot_custom_timeout(&self, custom_timeout: u32) -> Result<(), Error> {
         self.network
             .wait_vm_boot(custom_timeout)
             .map_err(Error::WaitForBoot)
@@ -1214,7 +1323,7 @@ impl Guest {
         );
     }
 
-    pub fn reboot_linux(&self, current_reboot_count: u32, custom_timeout: Option<i32>) {
+    pub fn reboot_linux(&self, current_reboot_count: u32) {
         let list_boots_cmd = "sudo last | grep -c reboot";
         let boot_count = self
             .ssh_command(list_boots_cmd)
@@ -1226,7 +1335,7 @@ impl Guest {
         assert_eq!(boot_count, current_reboot_count + 1);
         self.ssh_command("sudo reboot").unwrap();
 
-        self.wait_vm_boot(custom_timeout).unwrap();
+        self.wait_vm_boot().unwrap();
         let boot_count = self
             .ssh_command(list_boots_cmd)
             .unwrap()
@@ -1297,6 +1406,138 @@ impl Guest {
             self.ssh_command("sudo rm /mnt/test").unwrap();
             assert_eq!(self.ssh_command("sudo umount /mnt").unwrap(), "");
         }
+    }
+
+    pub fn get_expected_seq_events_for_simple_launch(&self) -> Vec<MetaEvent> {
+        let mut out_evt = vec![
+            MetaEvent {
+                event: "starting".to_string(),
+                device_id: None,
+            },
+            MetaEvent {
+                event: "booting".to_string(),
+                device_id: None,
+            },
+            MetaEvent {
+                event: "booted".to_string(),
+                device_id: None,
+            },
+            MetaEvent {
+                event: "activated".to_string(),
+                device_id: Some("_disk0".to_string()),
+            },
+        ];
+        // For confidential VM, reset of the device does not trigger a VMM exit, or
+        // It is handled in the PSP
+        // so we won't receive the "reset" event for disk0.
+        if self.vm_type != GuestVmType::Confidential {
+            out_evt.push(MetaEvent {
+                event: "reset".to_string(),
+                device_id: Some("_disk0".to_string()),
+            });
+        }
+        out_evt
+    }
+
+    pub fn default_cpus_string(&self) -> String {
+        format!(
+            "boot={}{}",
+            self.num_cpu,
+            if self.nested { "" } else { ",nested=off" }
+        )
+    }
+
+    pub fn default_cpus_with_affinity_string(&self) -> String {
+        format!(
+            "boot={},affinity=[0@[0,2],1@[1,3]]{}",
+            self.num_cpu,
+            if self.nested { "" } else { ",nested=off" }
+        )
+    }
+
+    pub fn default_memory_string(&self) -> String {
+        format!("size={}", self.mem_size_str)
+    }
+
+    pub fn validate_cpu_count(&self, expected_cpu_count: Option<u32>) {
+        let cpu = match expected_cpu_count {
+            Some(count) => count,
+            None => self.num_cpu,
+        };
+        assert_eq!(self.get_cpu_count().unwrap_or_default(), cpu);
+    }
+
+    fn get_expected_memory(&self) -> Option<u32> {
+        // For confidential VMs, the memory available to the guest is less than
+        // the memory assigned to the VM, as some of it is reserved for the PSP
+        // and bounce buffers.
+        // So we return the expected available memory for confidential VMs here.
+        let memory = match self.mem_size_str.as_str() {
+            "512M" => {
+                if self.vm_type == GuestVmType::Confidential {
+                    407_000
+                } else {
+                    480_000
+                }
+            }
+            "1G" => {
+                if self.vm_type == GuestVmType::Confidential {
+                    920_000
+                } else {
+                    960_000
+                }
+            }
+            // More to be added if more memory sizes are used in the tests
+            _ => panic!("Unsupported memory size: {}", self.mem_size_str),
+        };
+        Some(memory)
+    }
+
+    pub fn validate_memory(&self, expected_memory: Option<u32>) {
+        let memory = expected_memory
+            .or_else(|| self.get_expected_memory())
+            .unwrap_or_default();
+
+        assert!(self.get_total_memory().unwrap_or_default() > memory);
+    }
+}
+
+// A factory for creating guests with different configurations. The factory is initialized
+// with a GuestVmType, and created guests will have the same GuestVmType as the factory.
+// This allows creation of guests with different configurations (e.g. regular vs confidential)
+// without specifying the GuestVmType each time.
+// Based on the VmType, the default timeout for waiting for the VM to boot is also set,
+// which is used in the wait_vm_boot() method of the Guest struct. Additionally, nested
+// virtualization is disabled by default for confidential VMs, as it is not supported.
+pub struct GuestFactory {
+    vm_type: GuestVmType,
+    boot_timeout: u32,
+    nested: bool,
+}
+
+impl GuestFactory {
+    pub fn new_regular_guest_factory() -> Self {
+        Self {
+            vm_type: GuestVmType::Regular,
+            boot_timeout: DEFAULT_TCP_LISTENER_TIMEOUT,
+            nested: true,
+        }
+    }
+
+    pub fn new_confidential_guest_factory() -> Self {
+        Self {
+            vm_type: GuestVmType::Confidential,
+            boot_timeout: DEFAULT_CVM_TCP_LISTENER_TIMEOUT,
+            nested: false,
+        }
+    }
+
+    pub fn create_guest(&self, disk_config: Box<dyn DiskConfig>) -> Guest {
+        let mut guest = Guest::new(disk_config);
+        guest.vm_type = self.vm_type;
+        guest.boot_timeout = self.boot_timeout;
+        guest.nested = self.nested;
+        guest
     }
 }
 
@@ -1426,40 +1667,97 @@ impl<'a> GuestCommand<'a> {
     }
 
     pub fn default_disks(&mut self) -> &mut Self {
-        if self.guest.disk_config.disk(DiskType::CloudInit).is_some() {
+        self.default_disks_inner(true)
+    }
+
+    pub fn default_disks_sparse_off(&mut self) -> &mut Self {
+        self.default_disks_inner(false)
+    }
+
+    fn default_disks_inner(&mut self, sparse: bool) -> &mut Self {
+        let sparse_opt = if sparse { "" } else { ",sparse=off" };
+        let os_disk = format!(
+            "path={}{}",
+            self.guest
+                .disk_config
+                .disk(DiskType::OperatingSystem)
+                .unwrap(),
+            sparse_opt
+        );
+        if let Some(cloud_init) = self.guest.disk_config.disk(DiskType::CloudInit) {
             self.args([
                 "--disk",
-                format!(
-                    "path={}",
-                    self.guest
-                        .disk_config
-                        .disk(DiskType::OperatingSystem)
-                        .unwrap()
-                )
-                .as_str(),
-                format!(
-                    "path={}",
-                    self.guest.disk_config.disk(DiskType::CloudInit).unwrap()
-                )
-                .as_str(),
+                os_disk.as_str(),
+                format!("path={cloud_init}").as_str(),
             ])
         } else {
-            self.args([
-                "--disk",
-                format!(
-                    "path={}",
-                    self.guest
-                        .disk_config
-                        .disk(DiskType::OperatingSystem)
-                        .unwrap()
-                )
-                .as_str(),
-            ])
+            self.args(["--disk", os_disk.as_str()])
         }
     }
 
     pub fn default_net(&mut self) -> &mut Self {
         self.args(["--net", self.guest.default_net_string().as_str()])
+    }
+
+    pub fn default_kernel_cmdline_with_platform(&mut self, platform: Option<&str>) -> &mut Self {
+        if self.guest.vm_type == GuestVmType::Confidential {
+            let console_str = if let Some(c) = &self.guest.console_type {
+                c.as_str()
+            } else {
+                "hvc0"
+            };
+            let igvm = direct_igvm_boot_path(Some(console_str))
+                .expect("IGVM boot file not found for console type: {console_str}");
+            self.command.args([
+                "--igvm",
+                igvm.to_str().expect("IGVM path is not valid UTF-8"),
+            ]);
+            self.command
+                .args(["--host-data", generate_host_data().as_str()]);
+            self.command.args([
+                "--platform",
+                &format!(
+                    "{}sev_snp=on",
+                    if let Some(p) = platform {
+                        format!("{p},")
+                    } else {
+                        String::new()
+                    }
+                ),
+            ]);
+        } else if let Some(kernel) = &self.guest.kernel_path {
+            self.command.args(["--kernel", kernel.as_str()]);
+            if let Some(cmdline) = &self.guest.kernel_cmdline {
+                self.command.args(["--cmdline", cmdline]);
+            }
+            if let Some(platform_arg) = platform {
+                self.command.args(["--platform", platform_arg]);
+            }
+        }
+
+        self
+    }
+
+    pub fn default_kernel_cmdline(&mut self) -> &mut Self {
+        self.default_kernel_cmdline_with_platform(None)
+    }
+
+    pub fn default_cpus(&mut self) -> &mut Self {
+        self.args(["--cpus", self.guest.default_cpus_string().as_str()])
+    }
+
+    pub fn default_cpus_with_affinity(&mut self) -> &mut Self {
+        // Only support cpu affinity for 2 VCPUs for now,
+        // as it is only used in a test that validates cpu affinity is applied correctly.
+        assert_eq!(self.guest.num_cpu, 2);
+        self.args([
+            "--cpus",
+            self.guest.default_cpus_with_affinity_string().as_str(),
+        ])
+    }
+
+    pub fn default_memory(&mut self) -> &mut Self {
+        self.args(["--memory", self.guest.default_memory_string().as_str()])
     }
 }
 
@@ -1476,6 +1774,42 @@ pub fn clh_command(cmd: &str) -> String {
 
     let full_path = workspace_root.join(&target_cmd_path);
     String::from(full_path.to_str().unwrap())
+}
+
+pub fn remote_command(api_socket: &str, command: &str, arg: Option<&str>) -> bool {
+    let mut cmd = Command::new(clh_command("ch-remote"));
+    cmd.args([&format!("--api-socket={api_socket}"), command]);
+
+    if let Some(arg) = arg {
+        cmd.arg(arg);
+    }
+
+    let output = cmd.output().unwrap();
+    if output.status.success() {
+        true
+    } else {
+        eprintln!("Error running ch-remote command: {:?}", &cmd);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!("stderr: {stderr}");
+        false
+    }
+}
+
+pub fn remote_command_w_output(
+    api_socket: &str,
+    command: &str,
+    arg: Option<&str>,
+) -> (bool, Vec<u8>) {
+    let mut cmd = Command::new(clh_command("ch-remote"));
+    cmd.args([&format!("--api-socket={api_socket}"), command]);
+
+    if let Some(arg) = arg {
+        cmd.arg(arg);
+    }
+
+    let output = cmd.output().expect("Failed to launch ch-remote");
+
+    (output.status.success(), output.stdout)
 }
 
 pub fn parse_iperf3_output(output: &[u8], sender: bool, bandwidth: bool) -> Result<f64, Error> {
@@ -1858,3 +2192,121 @@ pub fn extract_bar_address(output: &str, device_desc: &str, bar_index: usize) ->
     }
     None
 }
+
+#[derive(PartialEq, Clone, Copy)]
+pub enum GuestVmType {
+    Regular,
+    Confidential,
+}
+
+// Get the direct igvm boot file path based on the console type
+fn direct_igvm_boot_path(console: Option<&str>) -> Option<PathBuf> {
+    // get the default hvc0 igvm file if console string is not passed
+    let console_str = console.unwrap_or("hvc0");
+
+    if console_str != "hvc0" && console_str != "ttyS0" {
+        panic!("IGVM console should be hvc0 or ttyS0, got: {console_str}");
+    }
+
+    let igvm_filepath = format!("/igvm_files/linux-{console_str}.bin");
+    if Path::new(&igvm_filepath).exists() {
+        Some(PathBuf::from(igvm_filepath))
+    } else {
+        None
+    }
+}
+
+// Generate a random 64-character hex string for host data
+fn generate_host_data() -> String {
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+// Creates the path for direct kernel boot and return the path.
+// For x86_64, this function returns the vmlinux kernel path.
+// For AArch64, this function returns the PE kernel path.
+pub fn direct_kernel_boot_path() -> PathBuf {
+    let mut workload_path = dirs::home_dir().unwrap();
+    workload_path.push("workloads");
+
+    let mut kernel_path = workload_path;
+    #[cfg(target_arch = "x86_64")]
+    kernel_path.push("vmlinux-x86_64");
+    #[cfg(target_arch = "aarch64")]
+    kernel_path.push("Image-arm64");
+
+    kernel_path
+}
+
+pub fn edk2_path() -> PathBuf {
+    let mut workload_path = dirs::home_dir().unwrap();
+    workload_path.push("workloads");
+    let mut edk2_path = workload_path;
+    edk2_path.push(OVMF_NAME);
+
+    edk2_path
+}
+
+pub const DIRECT_KERNEL_BOOT_CMDLINE: &str =
+    "root=/dev/vda1 console=hvc0 rw systemd.journald.forward_to_console=1";
+
+pub const CONSOLE_TEST_STRING: &str = "Started OpenBSD Secure Shell server";
+
+// Constant taken from the VMM crate.
+pub const MAX_NUM_PCI_SEGMENTS: u16 = 96;
+
+#[cfg(target_arch = "x86_64")]
+pub mod x86_64 {
+    pub const FOCAL_IMAGE_NAME: &str = "focal-server-cloudimg-amd64-custom-20210609-0.raw";
+    pub const JAMMY_VFIO_IMAGE_NAME: &str =
+        "jammy-server-cloudimg-amd64-custom-vfio-20241012-0.raw";
+    pub const FOCAL_IMAGE_NAME_VHD: &str = "focal-server-cloudimg-amd64-custom-20210609-0.vhd";
+    pub const FOCAL_IMAGE_NAME_VHDX: &str = "focal-server-cloudimg-amd64-custom-20210609-0.vhdx";
+    pub const JAMMY_IMAGE_NAME: &str = "jammy-server-cloudimg-amd64-custom-20241017-0.raw";
+    pub const JAMMY_IMAGE_NAME_QCOW2: &str = "jammy-server-cloudimg-amd64-custom-20241017-0.qcow2";
+    pub const JAMMY_IMAGE_NAME_QCOW2_ZLIB: &str =
+        "jammy-server-cloudimg-amd64-custom-20241017-0-zlib.qcow2";
+    pub const JAMMY_IMAGE_NAME_QCOW2_ZSTD: &str =
+        "jammy-server-cloudimg-amd64-custom-20241017-0-zstd.qcow2";
+    pub const JAMMY_IMAGE_NAME_QCOW2_BACKING_ZSTD_FILE: &str =
+        "jammy-server-cloudimg-amd64-custom-20241017-0-backing-zstd.qcow2";
+    pub const JAMMY_IMAGE_NAME_QCOW2_BACKING_UNCOMPRESSED_FILE: &str =
+        "jammy-server-cloudimg-amd64-custom-20241017-0-backing-uncompressed.qcow2";
+    pub const JAMMY_IMAGE_NAME_QCOW2_BACKING_RAW_FILE: &str =
+        "jammy-server-cloudimg-amd64-custom-20241017-0-backing-raw.qcow2";
+    pub const WINDOWS_IMAGE_NAME: &str = "windows-server-2022-amd64-2.raw";
+    pub const OVMF_NAME: &str = "CLOUDHV.fd";
+    pub const GREP_SERIAL_IRQ_CMD: &str = "grep -c 'IO-APIC.*ttyS0' /proc/interrupts || true";
+}
+
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::*;
+
+#[cfg(target_arch = "aarch64")]
+pub mod aarch64 {
+    pub const FOCAL_IMAGE_NAME: &str = "focal-server-cloudimg-arm64-custom-20210929-0.raw";
+    pub const FOCAL_IMAGE_UPDATE_KERNEL_NAME: &str =
+        "focal-server-cloudimg-arm64-custom-20210929-0-update-kernel.raw";
+    pub const FOCAL_IMAGE_NAME_VHD: &str = "focal-server-cloudimg-arm64-custom-20210929-0.vhd";
+    pub const FOCAL_IMAGE_NAME_VHDX: &str = "focal-server-cloudimg-arm64-custom-20210929-0.vhdx";
+    pub const JAMMY_IMAGE_NAME: &str = "jammy-server-cloudimg-arm64-custom-20220329-0.raw";
+    pub const JAMMY_IMAGE_NAME_QCOW2: &str = "jammy-server-cloudimg-arm64-custom-20220329-0.qcow2";
+    pub const JAMMY_IMAGE_NAME_QCOW2_ZLIB: &str =
+        "jammy-server-cloudimg-arm64-custom-20220329-0-zlib.qcow2";
+    pub const JAMMY_IMAGE_NAME_QCOW2_ZSTD: &str =
+        "jammy-server-cloudimg-arm64-custom-20220329-0-zstd.qcow2";
+    pub const JAMMY_IMAGE_NAME_QCOW2_BACKING_ZSTD_FILE: &str =
+        "jammy-server-cloudimg-arm64-custom-20220329-0-backing-zstd.qcow2";
+    pub const JAMMY_IMAGE_NAME_QCOW2_BACKING_UNCOMPRESSED_FILE: &str =
+        "jammy-server-cloudimg-arm64-custom-20220329-0-backing-uncompressed.qcow2";
+    pub const JAMMY_IMAGE_NAME_QCOW2_BACKING_RAW_FILE: &str =
+        "jammy-server-cloudimg-arm64-custom-20220329-0-backing-raw.qcow2";
+    pub const WINDOWS_IMAGE_NAME: &str = "windows-11-iot-enterprise-aarch64.raw";
+    pub const OVMF_NAME: &str = "CLOUDHV_EFI.fd";
+    pub const GREP_SERIAL_IRQ_CMD: &str = "grep -c 'GICv3.*uart-pl011' /proc/interrupts || true";
+    pub const GREP_PMU_IRQ_CMD: &str = "grep -c 'GICv3.*arm-pmu' /proc/interrupts || true";
+}
+
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::*;

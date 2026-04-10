@@ -13,14 +13,15 @@ use anyhow::anyhow;
 #[cfg(target_arch = "x86_64")]
 use arc_swap::ArcSwap;
 #[cfg(feature = "sev_snp")]
+use log::error;
+#[cfg(feature = "sev_snp")]
 use log::info;
 use log::{debug, warn};
 use mshv_bindings::*;
 #[cfg(target_arch = "x86_64")]
 use mshv_ioctls::InterruptRequest;
 use mshv_ioctls::{
-    Mshv, NoDatamatch, VcpuFd, VmFd, VmType, make_default_partition_create_arg,
-    make_default_synthetic_features_mask, set_registers_64,
+    Mshv, NoDatamatch, VcpuFd, VmFd, VmType, make_default_synthetic_features_mask, set_registers_64,
 };
 use vfio_ioctls::VfioDeviceFd;
 use vm::DataMatch;
@@ -85,6 +86,12 @@ use crate::arch::x86::{CpuIdEntry, FpuState, MsrEntry};
 use crate::{CpuState, IoEventAddress, IrqRoutingEntry, MpState};
 
 pub const PAGE_SHIFT: usize = 12;
+
+// SVM exit codes not yet defined in mshv-bindings (AMD APM Vol 2, Table 15-7)
+#[cfg(feature = "sev_snp")]
+const SVM_EXITCODE_CPUID: u32 = 0x72;
+#[cfg(feature = "sev_snp")]
+const SVM_EXITCODE_MSR: u32 = 0x7c;
 
 #[cfg(target_arch = "x86_64")]
 impl From<MshvClockData> for ClockData {
@@ -286,7 +293,8 @@ impl hypervisor::Hypervisor for MshvHypervisor {
                 VmType::Normal
             };
         }
-        let mut create_args = make_default_partition_create_arg(mshv_vm_type);
+
+        let mut create_args = self.mshv.make_default_partition_create_arg(mshv_vm_type);
         let mut disable_proc_features = hv_partition_processor_features::default();
         // SAFETY: Accessing a union element from bindgen generated bindings.
         unsafe {
@@ -306,6 +314,10 @@ impl hypervisor::Hypervisor for MshvHypervisor {
                     disable_proc_features
                         .__bindgen_anon_1
                         .set_nested_virt_support(1u64);
+                }
+
+                if _config.smt_enabled {
+                    create_args.pt_flags |= 1 << MSHV_PT_BIT_SMT_ENABLED_GUEST;
                 }
             }
             // Modified feature bit fields are written back to create_args
@@ -342,7 +354,7 @@ impl hypervisor::Hypervisor for MshvHypervisor {
             Ok(Arc::new(MshvVm {
                 fd: vm_fd,
                 msrs: ArcSwap::new(Vec::<MsrEntry>::new().into()),
-                dirty_log_slots: Arc::new(RwLock::new(HashMap::new())),
+                dirty_log_slots: RwLock::new(HashMap::new()),
                 #[cfg(feature = "sev_snp")]
                 sev_snp_enabled: mshv_vm_type == VmType::Snp,
                 #[cfg(feature = "sev_snp")]
@@ -360,7 +372,7 @@ impl hypervisor::Hypervisor for MshvHypervisor {
         {
             Ok(Arc::new(MshvVm {
                 fd: vm_fd,
-                dirty_log_slots: Arc::new(RwLock::new(HashMap::new())),
+                dirty_log_slots: RwLock::new(HashMap::new()),
             }))
         }
     }
@@ -869,6 +881,19 @@ impl cpu::Vcpu for MshvVcpu {
                     assert!(info.header.intercept_access_type == HV_INTERCEPT_ACCESS_EXECUTE as u8);
 
                     match ghcb_op {
+                        GHCB_INFO_SPECIAL_DBGPRINT => {
+                            // Handle debug print from guest
+                            // The guest sends a character to print via GHCB data
+                            // Sample debug print implementation that only prints ASCII characters and ignores the rest
+                            // let char_to_print = (ghcb_data & 0xFF) as u8;
+                            // if char_to_print.is_ascii() {
+                            // debug!("'{}'", char_to_print as char);
+                            // }
+                            // Not printing the character to slow down the guest a bit,
+                            // as these debug prints can be very frequent.
+                            // In real implementation, we might want to buffer these characters and
+                            // print them out together or implement some rate limiting.]
+                        }
                         GHCB_INFO_HYP_FEATURE_REQUEST => {
                             // Pre-condition: GHCB data must be zero
                             assert!(ghcb_data == 0);
@@ -1182,10 +1207,103 @@ impl cpu::Vcpu for MshvVcpu {
                                     // Clear the SW_EXIT_INFO1 register to indicate no error
                                     self.clear_swexit_info1()?;
                                 }
+                                SVM_EXITCODE_CPUID => {
+                                    // SAFETY: Accessing fields from the mapped GHCB page
+                                    let cpuid_fn = unsafe { (*ghcb).rax } as u32;
+                                    // SAFETY: Accessing fields from the mapped GHCB page
+                                    let cpuid_idx = unsafe { (*ghcb).rcx } as u32;
+                                    // SAFETY: Accessing fields from the mapped GHCB page
+                                    let xcr0 = unsafe { (*ghcb).xfem };
+                                    // SAFETY: Accessing fields from the mapped GHCB page
+                                    let xss = unsafe { (*ghcb).xss };
+                                    debug!("GHCB CPUID: fn=0x{cpuid_fn:x} idx=0x{cpuid_idx:x}");
+
+                                    let cpuid_result = self
+                                        .fd
+                                        .get_cpuid_values(cpuid_fn, cpuid_idx, xcr0, xss)
+                                        .unwrap_or([0u32; 4]);
+
+                                    set_svm_field_u64_ptr!(ghcb, rax, cpuid_result[0] as u64);
+                                    set_svm_field_u64_ptr!(ghcb, rbx, cpuid_result[1] as u64);
+                                    set_svm_field_u64_ptr!(ghcb, rcx, cpuid_result[2] as u64);
+                                    set_svm_field_u64_ptr!(ghcb, rdx, cpuid_result[3] as u64);
+
+                                    self.clear_swexit_info1()?;
+                                }
+                                SVM_EXITCODE_MSR => {
+                                    let exit_info1 =
+                                        info.__bindgen_anon_2.__bindgen_anon_1.sw_exit_info1;
+                                    // SAFETY: Accessing fields from the mapped GHCB page
+                                    let msr_index = unsafe { (*ghcb).rcx } as u32;
+                                    let is_write = exit_info1 & 1 != 0;
+
+                                    if is_write {
+                                        // SAFETY: Accessing fields from the mapped GHCB page
+                                        let msr_lo = unsafe { (*ghcb).rax } as u32;
+                                        // SAFETY: Accessing fields from the mapped GHCB page
+                                        let msr_hi = unsafe { (*ghcb).rdx } as u32;
+                                        let msr_val = ((msr_hi as u64) << 32) | (msr_lo as u64);
+                                        debug!(
+                                            "GHCB MSR WRITE: index=0x{msr_index:x} val=0x{msr_val:x}"
+                                        );
+                                        let entry = msr_entry {
+                                            index: msr_index,
+                                            data: msr_val,
+                                            ..Default::default()
+                                        };
+                                        let msr_entries = MsrEntries::from_entries(&[entry])
+                                            .map_err(|e| {
+                                                cpu::HypervisorCpuError::RunVcpu(e.into())
+                                            })?;
+                                        self.fd.set_msrs(&msr_entries).map_err(|e| {
+                                            cpu::HypervisorCpuError::RunVcpu(e.into())
+                                        })?;
+                                    } else {
+                                        let entry = msr_entry {
+                                            index: msr_index,
+                                            ..Default::default()
+                                        };
+                                        let mut msr_entries = MsrEntries::from_entries(&[entry])
+                                            .map_err(|e| {
+                                                cpu::HypervisorCpuError::RunVcpu(e.into())
+                                            })?;
+                                        self.fd.get_msrs(&mut msr_entries).map_err(|e| {
+                                            cpu::HypervisorCpuError::RunVcpu(e.into())
+                                        })?;
+                                        let msr_slice = msr_entries.as_slice();
+                                        if msr_slice.is_empty() {
+                                            return Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
+                                                "get_msrs returned no entries for index 0x{msr_index:x}"
+                                            )));
+                                        }
+                                        let msr_val = msr_slice[0].data;
+                                        debug!(
+                                            "GHCB MSR READ: index=0x{msr_index:x} val=0x{msr_val:x}"
+                                        );
+                                        set_svm_field_u64_ptr!(ghcb, rax, msr_val & 0xFFFFFFFF);
+                                        set_svm_field_u64_ptr!(ghcb, rdx, msr_val >> 32);
+                                    }
+
+                                    self.clear_swexit_info1()?;
+                                }
                                 _ => {
                                     panic!("GHCB_INFO_NORMAL: Unhandled exit code: {exit_code:0x}")
                                 }
                             }
+                        }
+                        GHCB_INFO_SHUTDOWN_REQUEST => {
+                            let ghcb_msr_val = { info.ghcb_msr };
+                            let reason_set = (ghcb_msr_val >> 12) & 0xf;
+                            let reason_val = (ghcb_msr_val >> 16) & 0xff;
+                            error!(
+                                "GHCB_MSR_TERM_REQ: Guest terminated! \
+                                 ghcb_msr=0x{ghcb_msr_val:x}, \
+                                 reason_set={reason_set}, reason_val={reason_val}"
+                            );
+                            return Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
+                                "Guest requested termination via GHCB_MSR_TERM_REQ \
+                                 (reason_set={reason_set}, reason_val={reason_val})"
+                            )));
                         }
                         _ => panic!("Unsupported VMGEXIT operation: {ghcb_op:0x}"),
                     }
@@ -1699,7 +1817,7 @@ pub struct MshvVm {
     fd: Arc<VmFd>,
     #[cfg(target_arch = "x86_64")]
     msrs: ArcSwap<Vec<MsrEntry>>,
-    dirty_log_slots: Arc<RwLock<HashMap<u64, MshvDirtyLogSlot>>>,
+    dirty_log_slots: RwLock<HashMap<u64, MshvDirtyLogSlot>>,
     #[cfg(feature = "sev_snp")]
     sev_snp_enabled: bool,
     #[cfg(feature = "sev_snp")]

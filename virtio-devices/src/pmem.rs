@@ -31,7 +31,7 @@ use vmm_sys_util::eventfd::EventFd;
 
 use super::{
     ActivateError, ActivateResult, EPOLL_HELPER_EVENT_LAST, EpollHelper, EpollHelperError,
-    EpollHelperHandler, Error as DeviceError, VIRTIO_F_IOMMU_PLATFORM, VIRTIO_F_VERSION_1,
+    EpollHelperHandler, Error as DeviceError, VIRTIO_F_ACCESS_PLATFORM, VIRTIO_F_VERSION_1,
     VirtioCommon, VirtioDevice, VirtioDeviceType,
 };
 use crate::seccomp_filters::Thread;
@@ -307,7 +307,7 @@ impl Pmem {
             let mut avail_features = 1u64 << VIRTIO_F_VERSION_1;
 
             if iommu {
-                avail_features |= 1u64 << VIRTIO_F_IOMMU_PLATFORM;
+                avail_features |= 1u64 << VIRTIO_F_ACCESS_PLATFORM;
             }
             (avail_features, 0, config, false)
         };
@@ -377,12 +377,13 @@ impl VirtioDevice for Pmem {
         self.read_config_from_slice(self.config.as_slice(), offset, data);
     }
 
-    fn activate(
-        &mut self,
-        mem: GuestMemoryAtomic<GuestMemoryMmap>,
-        interrupt_cb: Arc<dyn VirtioInterrupt>,
-        mut queues: Vec<(usize, Queue, EventFd)>,
-    ) -> ActivateResult {
+    fn activate(&mut self, context: crate::device::ActivationContext) -> ActivateResult {
+        let crate::device::ActivationContext {
+            mem,
+            interrupt_cb,
+            mut queues,
+            ..
+        } = context;
         self.common.activate(&queues, interrupt_cb.clone())?;
         let (kill_evt, pause_evt) = self.common.dup_eventfds();
         if let Some(disk) = self.disk.as_ref() {

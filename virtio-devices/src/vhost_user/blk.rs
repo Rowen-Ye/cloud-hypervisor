@@ -3,13 +3,12 @@
 
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Barrier, Mutex};
-use std::{mem, result, thread};
+use std::{mem, result};
 
 use block::VirtioBlockConfig;
 use event_monitor::event;
 use log::{error, info};
 use seccompiler::SeccompAction;
-use serde::{Deserialize, Serialize};
 use vhost::vhost_user::message::{
     VhostUserConfigFlags, VhostUserProtocolFeatures, VhostUserVirtioFeatures,
 };
@@ -19,7 +18,6 @@ use virtio_bindings::virtio_blk::{
     VIRTIO_BLK_F_GEOMETRY, VIRTIO_BLK_F_MQ, VIRTIO_BLK_F_RO, VIRTIO_BLK_F_SEG_MAX,
     VIRTIO_BLK_F_SIZE_MAX, VIRTIO_BLK_F_TOPOLOGY, VIRTIO_BLK_F_WRITE_ZEROES,
 };
-use virtio_queue::Queue;
 use vm_memory::{ByteValued, GuestMemoryAtomic};
 use vm_migration::protocol::MemoryRangeTable;
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
@@ -30,30 +28,21 @@ use super::vu_common_ctrl::{VhostUserConfig, VhostUserHandle};
 use super::{DEFAULT_VIRTIO_FEATURES, Error, Result};
 use crate::seccomp_filters::Thread;
 use crate::thread_helper::spawn_virtio_thread;
-use crate::vhost_user::VhostUserCommon;
-use crate::{GuestMemoryMmap, GuestRegionMmap, VIRTIO_F_IOMMU_PLATFORM, VirtioInterrupt};
+use crate::vhost_user::{VhostUserCommon, VhostUserState};
+use crate::{GuestMemoryMmap, GuestRegionMmap, VIRTIO_F_ACCESS_PLATFORM, VirtioInterrupt};
 
 const DEFAULT_QUEUE_NUMBER: usize = 1;
 
-#[derive(Serialize, Deserialize)]
-pub struct State {
-    pub avail_features: u64,
-    pub acked_features: u64,
-    pub config: VirtioBlockConfig,
-    pub acked_protocol_features: u64,
-    pub vu_num_queues: usize,
-}
+pub type State = VhostUserState<VirtioBlockConfig>;
 
 struct BackendReqHandler {}
 impl VhostUserFrontendReqHandler for BackendReqHandler {}
 
 pub struct Blk {
-    common: VirtioCommon,
     vu_common: VhostUserCommon,
     id: String,
     config: VirtioBlockConfig,
     guest_memory: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
-    epoll_thread: Option<thread::JoinHandle<()>>,
     seccomp_action: SeccompAction,
     exit_evt: EventFd,
     iommu: bool,
@@ -81,6 +70,7 @@ impl Blk {
             vu_num_queues,
             config,
             paused,
+            vring_bases,
         ) = if let Some(state) = state {
             info!("Restoring vhost-user-block {id}");
 
@@ -89,6 +79,8 @@ impl Blk {
                 state.acked_protocol_features,
             )?;
 
+            vu.restore_state(&state)?;
+
             (
                 state.avail_features,
                 state.acked_features,
@@ -96,6 +88,7 @@ impl Blk {
                 state.vu_num_queues,
                 state.config,
                 true,
+                state.vring_bases,
             )
         } else {
             // Filling device and vring features VMM supports.
@@ -120,7 +113,8 @@ impl Blk {
                 | VhostUserProtocolFeatures::CONFIGURE_MEM_SLOTS
                 | VhostUserProtocolFeatures::REPLY_ACK
                 | VhostUserProtocolFeatures::INFLIGHT_SHMFD
-                | VhostUserProtocolFeatures::LOG_SHMFD;
+                | VhostUserProtocolFeatures::LOG_SHMFD
+                | VhostUserProtocolFeatures::DEVICE_STATE;
 
             let (acked_features, acked_protocol_features) =
                 vu.negotiate_features_vhost_user(avail_features, avail_protocol_features)?;
@@ -169,83 +163,68 @@ impl Blk {
                 num_queues,
                 config,
                 false,
+                None,
             )
         };
 
         Ok(Blk {
-            common: VirtioCommon {
-                device_type: VirtioDeviceType::Block as u32,
-                queue_sizes: vec![vu_cfg.queue_size; num_queues],
-                avail_features,
-                acked_features,
-                paused_sync: Some(Arc::new(Barrier::new(2))),
-                min_queues: DEFAULT_QUEUE_NUMBER as u16,
-                paused: Arc::new(AtomicBool::new(paused)),
-                ..Default::default()
-            },
             vu_common: VhostUserCommon {
+                virtio_common: VirtioCommon {
+                    device_type: VirtioDeviceType::Block as u32,
+                    queue_sizes: vec![vu_cfg.queue_size; num_queues],
+                    avail_features,
+                    acked_features,
+                    paused_sync: Some(Arc::new(Barrier::new(2))),
+                    min_queues: DEFAULT_QUEUE_NUMBER as u16,
+                    paused: Arc::new(AtomicBool::new(paused)),
+                    ..Default::default()
+                },
                 vu: Some(Arc::new(Mutex::new(vu))),
                 acked_protocol_features,
                 socket_path: vu_cfg.socket,
                 vu_num_queues,
+                vring_bases,
                 ..Default::default()
             },
             id,
             config,
             guest_memory: None,
-            epoll_thread: None,
             seccomp_action,
             exit_evt,
             iommu,
         })
     }
 
-    fn state(&self) -> State {
-        State {
-            avail_features: self.common.avail_features,
-            acked_features: self.common.acked_features,
-            config: self.config,
-            acked_protocol_features: self.vu_common.acked_protocol_features,
-            vu_num_queues: self.vu_common.vu_num_queues,
-        }
+    fn state(&self) -> std::result::Result<State, MigratableError> {
+        self.vu_common.state(self.config)
     }
 }
 
 impl Drop for Blk {
     fn drop(&mut self) {
-        if let Some(kill_evt) = self.common.kill_evt.take()
-            && let Err(e) = kill_evt.write(1)
-        {
-            error!("failed to kill vhost-user-blk: {e:?}");
-        }
-        self.common.wait_for_epoll_threads();
-        if let Some(thread) = self.epoll_thread.take()
-            && let Err(e) = thread.join()
-        {
-            error!("Error joining thread: {e:?}");
-        }
+        self.vu_common.shutdown();
     }
 }
 
 impl VirtioDevice for Blk {
     fn device_type(&self) -> u32 {
-        self.common.device_type
+        self.vu_common.virtio_common.device_type
     }
 
     fn queue_max_sizes(&self) -> &[u16] {
-        &self.common.queue_sizes
+        &self.vu_common.virtio_common.queue_sizes
     }
 
     fn features(&self) -> u64 {
-        let mut features = self.common.avail_features;
+        let mut features = self.vu_common.virtio_common.avail_features;
         if self.iommu {
-            features |= 1u64 << VIRTIO_F_IOMMU_PLATFORM;
+            features |= 1u64 << VIRTIO_F_ACCESS_PLATFORM;
         }
         features
     }
 
     fn ack_features(&mut self, value: u64) {
-        self.common.ack_features(value);
+        self.vu_common.virtio_common.ack_features(value);
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
@@ -279,33 +258,36 @@ impl VirtioDevice for Blk {
         }
     }
 
-    fn activate(
-        &mut self,
-        mem: GuestMemoryAtomic<GuestMemoryMmap>,
-        interrupt_cb: Arc<dyn VirtioInterrupt>,
-        queues: Vec<(usize, Queue, EventFd)>,
-    ) -> ActivateResult {
-        self.common.activate(&queues, interrupt_cb.clone())?;
+    fn activate(&mut self, context: crate::device::ActivationContext) -> ActivateResult {
+        let crate::device::ActivationContext {
+            mem,
+            interrupt_cb,
+            queues,
+            ..
+        } = context;
+        self.vu_common
+            .virtio_common
+            .activate(&queues, interrupt_cb.clone())?;
         self.guest_memory = Some(mem.clone());
 
         let backend_req_handler: Option<FrontendReqHandler<BackendReqHandler>> = None;
 
         // Run a dedicated thread for handling potential reconnections with
         // the backend.
-        let (kill_evt, pause_evt) = self.common.dup_eventfds();
+        let (kill_evt, pause_evt) = self.vu_common.virtio_common.dup_eventfds();
 
         let mut handler = self.vu_common.activate(
             mem,
             &queues,
             interrupt_cb,
-            self.common.acked_features,
+            self.vu_common.virtio_common.acked_features,
             backend_req_handler,
             kill_evt,
             pause_evt,
         )?;
 
-        let paused = self.common.paused.clone();
-        let paused_sync = self.common.paused_sync.clone();
+        let paused = self.vu_common.virtio_common.paused.clone();
+        let paused_sync = self.vu_common.virtio_common.paused_sync.clone();
 
         let mut epoll_threads = Vec::new();
 
@@ -317,15 +299,15 @@ impl VirtioDevice for Blk {
             &self.exit_evt,
             move || handler.run(&paused, paused_sync.as_ref().unwrap()),
         )?;
-        self.epoll_thread = Some(epoll_threads.remove(0));
+        self.vu_common.epoll_thread = Some(epoll_threads.remove(0));
 
         Ok(())
     }
 
     fn reset(&mut self) -> Option<Arc<dyn VirtioInterrupt>> {
         // We first must resume the virtio thread if it was paused.
-        if self.common.pause_evt.take().is_some() {
-            self.common.resume().ok()?;
+        if self.vu_common.virtio_common.pause_evt.take().is_some() {
+            self.vu_common.virtio_common.resume().ok()?;
         }
 
         if let Some(vu) = &self.vu_common.vu
@@ -335,7 +317,7 @@ impl VirtioDevice for Blk {
             return None;
         }
 
-        if let Some(kill_evt) = self.common.kill_evt.take() {
+        if let Some(kill_evt) = self.vu_common.virtio_common.kill_evt.take() {
             // Ignore the result because there is nothing we can do about it.
             let _ = kill_evt.write(1);
         }
@@ -343,7 +325,7 @@ impl VirtioDevice for Blk {
         event!("virtio-device", "reset", "id", &self.id);
 
         // Return the interrupt
-        Some(self.common.interrupt_cb.take().unwrap())
+        Some(self.vu_common.virtio_common.interrupt_cb.take().unwrap())
     }
 
     fn shutdown(&mut self) {
@@ -361,13 +343,13 @@ impl VirtioDevice for Blk {
 impl Pausable for Blk {
     fn pause(&mut self) -> result::Result<(), MigratableError> {
         self.vu_common.pause()?;
-        self.common.pause()
+        self.vu_common.virtio_common.pause()
     }
 
     fn resume(&mut self) -> result::Result<(), MigratableError> {
-        self.common.resume()?;
+        self.vu_common.virtio_common.resume()?;
 
-        if let Some(epoll_thread) = &self.epoll_thread {
+        if let Some(epoll_thread) = &self.vu_common.epoll_thread {
             epoll_thread.thread().unpark();
         }
 
@@ -381,7 +363,7 @@ impl Snapshottable for Blk {
     }
 
     fn snapshot(&mut self) -> std::result::Result<Snapshot, MigratableError> {
-        self.vu_common.snapshot(&self.state())
+        self.vu_common.snapshot(&self.state()?)
     }
 }
 impl Transportable for Blk {}
@@ -404,7 +386,6 @@ impl Migratable for Blk {
     }
 
     fn complete_migration(&mut self) -> std::result::Result<(), MigratableError> {
-        self.vu_common
-            .complete_migration(self.common.kill_evt.take())
+        self.vu_common.complete_migration()
     }
 }

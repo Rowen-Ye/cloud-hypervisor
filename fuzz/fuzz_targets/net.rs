@@ -64,7 +64,7 @@ fuzz_target!(|bytes: &[u8]| -> Corpus {
     }
 
     let (dummy_tap_frontend, dummy_tap_backend) = create_socketpair().unwrap();
-    let if_name = "fuzzer_tap_name".as_bytes().to_vec();
+    let if_name = "fuzzer_tap_name";
     let tap = net_util::Tap::new_for_fuzzing(dummy_tap_frontend, if_name);
 
     let mut net = virtio_devices::Net::new_with_tap(
@@ -143,11 +143,12 @@ fuzz_target!(|bytes: &[u8]| -> Corpus {
     input_queue_evt.write(1).unwrap();
     output_queue_evt.write(1).unwrap();
 
-    net.activate(
-        guest_memory,
-        Arc::new(NoopVirtioInterrupt {}),
-        vec![(0, input_queue, input_evt), (1, output_queue, output_evt)],
-    )
+    net.activate(virtio_devices::ActivationContext {
+        mem: guest_memory,
+        interrupt_cb: Arc::new(NoopVirtioInterrupt {}),
+        queues: vec![(0, input_queue, input_evt), (1, output_queue, output_evt)],
+        device_status: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+    })
     .unwrap();
 
     // Wait for the events to finish and net device worker thread to return
@@ -164,6 +165,15 @@ pub struct NoopVirtioInterrupt {}
 impl VirtioInterrupt for NoopVirtioInterrupt {
     fn trigger(&self, _int_type: VirtioInterruptType) -> std::result::Result<(), std::io::Error> {
         Ok(())
+    }
+
+    fn set_notifier(
+        &self,
+        _interrupt: u32,
+        _eventfd: Option<EventFd>,
+        _vm: &dyn hypervisor::Vm,
+    ) -> std::io::Result<()> {
+        unimplemented!()
     }
 }
 

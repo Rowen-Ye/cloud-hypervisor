@@ -25,6 +25,8 @@ use vhost::vhost_kern::vhost_binding::{
     VHOST_VDPA_SET_STATUS, VHOST_VDPA_SET_VRING_ENABLE, VHOST_VDPA_SUSPEND,
 };
 
+use crate::userfaultfd::{UFFDIO_API, UFFDIO_COPY, UFFDIO_REGISTER, UFFDIO_WAKE};
+
 #[derive(Copy, Clone)]
 pub enum Thread {
     HttpApi,
@@ -107,6 +109,11 @@ mod kvm {
     pub const KVM_GET_NESTED_STATE: u64 = 3229658814;
     pub const KVM_SET_NESTED_STATE: u64 = 1082175167;
 }
+
+// Block device ioctls (not exported by libc)
+const BLKDISCARD: u64 = 0x1277; // _IO(0x12, 119)
+const BLKZEROOUT: u64 = 0x127f; // _IO(0x12, 127)
+const BLKGETSIZE64: u64 = 0x80081272; // _IOR(0x12, 114, size_t)
 
 // MSHV IOCTL code. This is unstable until the kernel code has been declared stable.
 #[cfg(feature = "mshv")]
@@ -259,6 +266,9 @@ fn create_vmm_ioctl_seccomp_rule_common(
         and![Cond::new(1, ArgLen::Dword, Eq, BLKPBSZGET as _)?],
         and![Cond::new(1, ArgLen::Dword, Eq, BLKIOMIN as _)?],
         and![Cond::new(1, ArgLen::Dword, Eq, BLKIOOPT as _)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, BLKGETSIZE64 as _)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, BLKDISCARD as _)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, BLKZEROOUT as _)?],
         and![Cond::new(1, ArgLen::Dword, Eq, FIOCLEX as _)?],
         and![Cond::new(1, ArgLen::Dword, Eq, FIONBIO as _)?],
         and![Cond::new(1, ArgLen::Dword, Eq, SIOCGIFFLAGS)?],
@@ -356,6 +366,10 @@ fn create_vmm_ioctl_seccomp_rule_common(
             VHOST_VDPA_GET_CONFIG_SIZE()
         )?],
         and![Cond::new(1, ArgLen::Dword, Eq, VHOST_VDPA_SUSPEND())?],
+        and![Cond::new(1, ArgLen::Dword, Eq, UFFDIO_API)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, UFFDIO_COPY)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, UFFDIO_REGISTER)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, UFFDIO_WAKE)?],
     ];
 
     let hypervisor_rules = create_vmm_ioctl_seccomp_rule_hypervisor(hypervisor_type)?;
@@ -489,6 +503,7 @@ fn signal_handler_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, Backend
         (libc::SYS_close, vec![]),
         (libc::SYS_exit, vec![]),
         (libc::SYS_exit_group, vec![]),
+        (libc::SYS_fcntl, vec![]),
         (libc::SYS_futex, vec![]),
         (libc::SYS_ioctl, create_signal_handler_ioctl_seccomp_rule()?),
         (libc::SYS_landlock_create_ruleset, vec![]),
@@ -505,8 +520,6 @@ fn signal_handler_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, Backend
         (libc::SYS_sendto, vec![]),
         (libc::SYS_sigaltstack, vec![]),
         (libc::SYS_write, vec![]),
-        #[cfg(debug_assertions)]
-        (libc::SYS_fcntl, vec![]),
     ])
 }
 
@@ -522,7 +535,10 @@ fn pty_foreground_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, Backend
     Ok(vec![
         (libc::SYS_close, vec![]),
         (libc::SYS_exit_group, vec![]),
+        (libc::SYS_fcntl, vec![]),
+        (libc::SYS_getcwd, vec![]),
         (libc::SYS_getpgid, vec![]),
+        (libc::SYS_gettid, vec![]),
         #[cfg(target_arch = "x86_64")]
         (libc::SYS_getpgrp, vec![]),
         (libc::SYS_ioctl, create_pty_foreground_ioctl_seccomp_rule()?),
@@ -537,12 +553,8 @@ fn pty_foreground_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, Backend
         (libc::SYS_rt_sigreturn, vec![]),
         (libc::SYS_sched_yield, vec![]),
         (libc::SYS_setsid, vec![]),
-        (libc::SYS_gettid, vec![]),
         (libc::SYS_sigaltstack, vec![]),
         (libc::SYS_write, vec![]),
-        #[cfg(debug_assertions)]
-        (libc::SYS_fcntl, vec![]),
-        (libc::SYS_getcwd, vec![]),
     ])
 }
 
@@ -586,6 +598,7 @@ fn vmm_thread_rules(
         #[cfg(target_arch = "aarch64")]
         (libc::SYS_newfstatat, vec![]),
         (libc::SYS_futex, vec![]),
+        (libc::SYS_getcwd, vec![]),
         (libc::SYS_getdents64, vec![]),
         (libc::SYS_getpgid, vec![]),
         #[cfg(target_arch = "x86_64")]
@@ -685,10 +698,10 @@ fn vmm_thread_rules(
         (libc::SYS_unlink, vec![]),
         #[cfg(target_arch = "aarch64")]
         (libc::SYS_unlinkat, vec![]),
+        (libc::SYS_userfaultfd, vec![]),
         (libc::SYS_wait4, vec![]),
         (libc::SYS_write, vec![]),
         (libc::SYS_writev, vec![]),
-        (libc::SYS_getcwd, vec![]),
     ])
 }
 
@@ -788,11 +801,13 @@ fn vcpu_thread_rules(
         (libc::SYS_dup, vec![]),
         (libc::SYS_exit, vec![]),
         (libc::SYS_epoll_ctl, vec![]),
+        (libc::SYS_fcntl, vec![]),
         (libc::SYS_fstat, vec![]),
-        (libc::SYS_gettid, vec![]),
         (libc::SYS_futex, vec![]),
+        (libc::SYS_getcwd, vec![]),
         (libc::SYS_getrandom, vec![]),
         (libc::SYS_getpid, vec![]),
+        (libc::SYS_gettid, vec![]),
         (
             libc::SYS_ioctl,
             create_vcpu_ioctl_seccomp_rule(hypervisor_type)?,
@@ -811,6 +826,10 @@ fn vcpu_thread_rules(
         (libc::SYS_pread64, vec![]),
         (libc::SYS_pwrite64, vec![]),
         (libc::SYS_read, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_readlink, vec![]),
+        #[cfg(target_arch = "aarch64")]
+        (libc::SYS_readlinkat, vec![]),
         (libc::SYS_recvfrom, vec![]),
         (libc::SYS_recvmsg, vec![]),
         (libc::SYS_rt_sigaction, vec![]),
@@ -829,8 +848,6 @@ fn vcpu_thread_rules(
         (libc::SYS_unlinkat, vec![]),
         (libc::SYS_write, vec![]),
         (libc::SYS_writev, vec![]),
-        (libc::SYS_fcntl, vec![]),
-        (libc::SYS_getcwd, vec![]),
     ])
 }
 
@@ -850,6 +867,7 @@ fn http_api_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError>
         (libc::SYS_epoll_wait, vec![]),
         (libc::SYS_exit, vec![]),
         (libc::SYS_fcntl, vec![]),
+        (libc::SYS_getcwd, vec![]),
         (libc::SYS_gettid, vec![]),
         (libc::SYS_futex, vec![]),
         (libc::SYS_getrandom, vec![]),
@@ -863,12 +881,11 @@ fn http_api_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError>
         (libc::SYS_prctl, vec![]),
         (libc::SYS_recvfrom, vec![]),
         (libc::SYS_recvmsg, vec![]),
+        (libc::SYS_rt_sigprocmask, vec![]),
         (libc::SYS_sched_yield, vec![]),
         (libc::SYS_sendto, vec![]),
         (libc::SYS_sigaltstack, vec![]),
         (libc::SYS_write, vec![]),
-        (libc::SYS_rt_sigprocmask, vec![]),
-        (libc::SYS_getcwd, vec![]),
     ])
 }
 
@@ -886,7 +903,9 @@ fn dbus_api_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError>
         (libc::SYS_epoll_ctl, vec![]),
         (libc::SYS_exit, vec![]),
         (libc::SYS_gettid, vec![]),
+        (libc::SYS_fcntl, vec![]),
         (libc::SYS_futex, vec![]),
+        (libc::SYS_getcwd, vec![]),
         (libc::SYS_getrandom, vec![]),
         (libc::SYS_madvise, vec![]),
         (libc::SYS_mmap, vec![]),
@@ -902,7 +921,6 @@ fn dbus_api_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError>
         (libc::SYS_set_robust_list, vec![]),
         (libc::SYS_sigaltstack, vec![]),
         (libc::SYS_write, vec![]),
-        (libc::SYS_getcwd, vec![]),
     ])
 }
 
@@ -910,6 +928,7 @@ fn event_monitor_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendE
     Ok(vec![
         (libc::SYS_brk, vec![]),
         (libc::SYS_close, vec![]),
+        (libc::SYS_getcwd, vec![]),
         (libc::SYS_gettid, vec![]),
         (libc::SYS_futex, vec![]),
         (libc::SYS_landlock_create_ruleset, vec![]),
@@ -919,7 +938,6 @@ fn event_monitor_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendE
         (libc::SYS_prctl, vec![]),
         (libc::SYS_sched_yield, vec![]),
         (libc::SYS_write, vec![]),
-        (libc::SYS_getcwd, vec![]),
     ])
 }
 

@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::{fs, result};
 
+use block::ImageType;
+pub use block::fcntl::LockGranularityChoice;
 use log::{debug, warn};
 use net_util::MacAddr;
 use serde::{Deserialize, Serialize};
@@ -36,6 +38,14 @@ pub struct CpuFeatures {
     #[cfg(target_arch = "x86_64")]
     #[serde(default)]
     pub amx: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
+pub enum CoreScheduling {
+    #[default]
+    Vm, // All vCPUs have the same cookie so can share a core
+    Vcpu, // Each vCPU has a unique cookie so can't share a core
+    Off,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -71,6 +81,8 @@ pub struct CpusConfig {
     pub features: CpuFeatures,
     #[serde(default = "default_cpusconfig_nested")]
     pub nested: bool,
+    #[serde(default)]
+    pub core_scheduling: CoreScheduling,
 }
 
 pub const DEFAULT_VCPUS: u32 = 1;
@@ -86,6 +98,7 @@ impl Default for CpusConfig {
             affinity: None,
             features: CpuFeatures::default(),
             nested: true,
+            core_scheduling: CoreScheduling::default(),
         }
     }
 }
@@ -284,6 +297,14 @@ pub struct DiskConfig {
     pub serial: Option<String>,
     #[serde(default)]
     pub queue_affinity: Option<Vec<VirtQueueAffinity>>,
+    #[serde(default)]
+    pub backing_files: bool,
+    #[serde(default = "default_diskconfig_sparse")]
+    pub sparse: bool,
+    #[serde(default)]
+    pub image_type: ImageType,
+    #[serde(default)]
+    pub lock_granularity: LockGranularityChoice,
 }
 
 impl ApplyLandlock for DiskConfig {
@@ -305,6 +326,10 @@ pub const DEFAULT_DISK_QUEUE_SIZE: u16 = 128;
 
 pub fn default_diskconfig_queue_size() -> u16 {
     DEFAULT_DISK_QUEUE_SIZE
+}
+
+pub fn default_diskconfig_sparse() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -462,6 +487,24 @@ impl ApplyLandlock for FsConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct GenericVhostUserConfig {
+    pub socket: PathBuf,
+    pub queue_sizes: Vec<u16>,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub pci_segment: u16,
+    pub device_type: u32,
+}
+
+impl ApplyLandlock for GenericVhostUserConfig {
+    fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
+        landlock.add_rule_with_access(&self.socket, "rw")?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct PmemConfig {
     pub file: PathBuf,
     #[serde(default)]
@@ -510,6 +553,10 @@ pub fn default_consoleconfig_file() -> Option<PathBuf> {
 
 impl ApplyLandlock for ConsoleConfig {
     fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
+        if self.mode == ConsoleOutputMode::Pty {
+            landlock.add_rule_with_access(Path::new("/dev/pts"), "rw")?;
+            landlock.add_rule_with_access(Path::new("/dev/ptmx"), "rw")?;
+        }
         if let Some(file) = &self.file {
             landlock.add_rule_with_access(file, "rw")?;
         }
@@ -543,6 +590,10 @@ impl Default for DebugConsoleConfig {
 #[cfg(target_arch = "x86_64")]
 impl ApplyLandlock for DebugConsoleConfig {
     fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
+        if self.mode == ConsoleOutputMode::Pty {
+            landlock.add_rule_with_access(Path::new("/dev/pts"), "rw")?;
+            landlock.add_rule_with_access(Path::new("/dev/ptmx"), "rw")?;
+        }
         if let Some(file) = &self.file {
             landlock.add_rule_with_access(file, "rw")?;
         }
@@ -674,7 +725,6 @@ pub struct NumaDistance {
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct NumaConfig {
-    #[serde(default)]
     pub guest_numa_id: u32,
     #[serde(default)]
     pub cpus: Option<Vec<u32>>,
@@ -684,6 +734,8 @@ pub struct NumaConfig {
     pub memory_zones: Option<Vec<String>>,
     #[serde(default)]
     pub pci_segments: Option<Vec<u16>>,
+    #[serde(default)]
+    pub device_id: Option<String>,
 }
 
 /// Errors describing a misconfigured payload, i.e., a configuration that
@@ -912,6 +964,7 @@ pub struct VmConfig {
     #[serde(default)]
     pub rng: RngConfig,
     pub balloon: Option<BalloonConfig>,
+    pub generic_vhost_user: Option<Vec<GenericVhostUserConfig>>,
     pub fs: Option<Vec<FsConfig>>,
     pub pmem: Option<Vec<PmemConfig>>,
     #[serde(default = "default_serial")]
@@ -985,6 +1038,12 @@ impl VmConfig {
         if let Some(fs_configs) = &self.fs {
             for fs_config in fs_configs.iter() {
                 fs_config.apply_landlock(&mut landlock)?;
+            }
+        }
+
+        if let Some(generic_vhost_user_configs) = &self.generic_vhost_user {
+            for generic_vhost_user_config in generic_vhost_user_configs.iter() {
+                generic_vhost_user_config.apply_landlock(&mut landlock)?;
             }
         }
 

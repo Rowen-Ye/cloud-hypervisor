@@ -18,14 +18,14 @@ use serde::{Deserialize, Serialize};
 use serial_buffer::SerialBuffer;
 use thiserror::Error;
 use virtio_queue::{Queue, QueueT};
-use vm_memory::{ByteValued, Bytes, GuestAddressSpace, GuestMemory, GuestMemoryAtomic};
+use vm_memory::{ByteValued, Bytes, GuestAddressSpace, GuestMemoryAtomic};
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vm_virtio::{AccessPlatform, Translatable};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::{
     ActivateResult, EPOLL_HELPER_EVENT_LAST, EpollHelper, EpollHelperError, EpollHelperHandler,
-    Error as DeviceError, VIRTIO_F_IOMMU_PLATFORM, VIRTIO_F_VERSION_1, VirtioCommon, VirtioDevice,
+    Error as DeviceError, VIRTIO_F_ACCESS_PLATFORM, VIRTIO_F_VERSION_1, VirtioCommon, VirtioDevice,
     VirtioDeviceType, VirtioInterruptType,
 };
 use crate::seccomp_filters::Thread;
@@ -51,8 +51,6 @@ const VIRTIO_CONSOLE_F_SIZE: u64 = 0;
 
 #[derive(Error, Debug)]
 enum Error {
-    #[error("Descriptor chain too short")]
-    DescriptorChainTooShort,
     #[error("Failed to read from guest memory")]
     GuestMemoryRead(#[source] vm_memory::guest_memory::Error),
     #[error("Failed to write to guest memory")]
@@ -210,21 +208,28 @@ impl ConsoleEpollHandler {
         }
 
         while let Some(mut desc_chain) = recv_queue.pop_descriptor_chain(self.mem.memory()) {
-            let desc = desc_chain.next().ok_or(Error::DescriptorChainTooShort)?;
-            let len = cmp::min(desc.len(), in_buffer.len() as u32);
-            let source_slice = in_buffer.drain(..len as usize).collect::<Vec<u8>>();
+            let mut total_len = 0;
+            while let Some(desc) = desc_chain.next() {
+                if in_buffer.is_empty() {
+                    break;
+                }
+                let len = cmp::min(desc.len(), in_buffer.len() as u32);
+                let source_slice = in_buffer.drain(..len as usize).collect::<Vec<u8>>();
 
-            desc_chain
-                .memory()
-                .write_slice(
-                    &source_slice[..],
-                    desc.addr()
-                        .translate_gva(self.access_platform.as_deref(), desc.len() as usize),
-                )
-                .map_err(Error::GuestMemoryWrite)?;
+                desc_chain
+                    .memory()
+                    .write_slice(
+                        &source_slice[..],
+                        desc.addr()
+                            .translate_gva(self.access_platform.as_deref(), desc.len() as usize),
+                    )
+                    .map_err(Error::GuestMemoryWrite)?;
+
+                total_len += len;
+            }
 
             recv_queue
-                .add_used(desc_chain.memory(), desc_chain.head_index(), len)
+                .add_used(desc_chain.memory(), desc_chain.head_index(), total_len)
                 .map_err(Error::QueueAddUsed)?;
             used_descs = true;
 
@@ -248,26 +253,32 @@ impl ConsoleEpollHandler {
         let mut used_descs = false;
 
         while let Some(mut desc_chain) = trans_queue.pop_descriptor_chain(self.mem.memory()) {
-            let desc = desc_chain.next().ok_or(Error::DescriptorChainTooShort)?;
-            if let Some(out) = &mut self.out {
-                let mut buf: Vec<u8> = Vec::new();
-                desc_chain
-                    .memory()
-                    .write_volatile_to(
-                        desc.addr()
-                            .translate_gva(self.access_platform.as_deref(), desc.len() as usize),
-                        &mut buf,
-                        desc.len() as usize,
-                    )
-                    .map_err(Error::GuestMemoryRead)?;
+            while let Some(desc) = desc_chain.next() {
+                if let Some(out) = &mut self.out {
+                    let mut buf: Vec<u8> = Vec::new();
+                    desc_chain
+                        .memory()
+                        .write_volatile_to(
+                            desc.addr().translate_gva(
+                                self.access_platform.as_deref(),
+                                desc.len() as usize,
+                            ),
+                            &mut buf,
+                            desc.len() as usize,
+                        )
+                        .map_err(Error::GuestMemoryRead)?;
 
-                out.write_all(&buf).map_err(Error::OutputWriteAll)?;
-                out.flush().map_err(Error::OutputFlush)?;
+                    out.write_all(&buf).map_err(Error::OutputWriteAll)?;
+                }
             }
             trans_queue
-                .add_used(desc_chain.memory(), desc_chain.head_index(), desc.len())
+                .add_used(desc_chain.memory(), desc_chain.head_index(), 0)
                 .map_err(Error::QueueAddUsed)?;
             used_descs = true;
+        }
+
+        if used_descs && let Some(out) = &mut self.out {
+            out.flush().map_err(Error::OutputFlush)?;
         }
 
         Ok(used_descs)
@@ -526,11 +537,7 @@ impl ConsoleResizer {
         if let Some(tty) = self.tty.as_ref() {
             let (cols, rows) = get_win_size(tty);
             self.config.lock().unwrap().update_console_size(cols, rows);
-            if self
-                .acked_features
-                .fetch_and(1u64 << VIRTIO_CONSOLE_F_SIZE, Ordering::AcqRel)
-                != 0
-            {
+            if self.acked_features.load(Ordering::Acquire) & (1u64 << VIRTIO_CONSOLE_F_SIZE) != 0 {
                 // Send the interrupt to the driver
                 let _ = self.config_evt.write(1);
             }
@@ -609,7 +616,7 @@ impl Console {
         } else {
             let mut avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_CONSOLE_F_SIZE);
             if iommu {
-                avail_features |= 1u64 << VIRTIO_F_IOMMU_PLATFORM;
+                avail_features |= 1u64 << VIRTIO_F_ACCESS_PLATFORM;
             }
 
             (
@@ -703,12 +710,13 @@ impl VirtioDevice for Console {
         self.read_config_from_slice(self.config.lock().unwrap().as_slice(), offset, data);
     }
 
-    fn activate(
-        &mut self,
-        mem: GuestMemoryAtomic<GuestMemoryMmap>,
-        interrupt_cb: Arc<dyn VirtioInterrupt>,
-        mut queues: Vec<(usize, Queue, EventFd)>,
-    ) -> ActivateResult {
+    fn activate(&mut self, context: crate::device::ActivationContext) -> ActivateResult {
+        let crate::device::ActivationContext {
+            mem,
+            interrupt_cb,
+            mut queues,
+            ..
+        } = context;
         self.common.activate(&queues, interrupt_cb.clone())?;
         self.resizer
             .acked_features

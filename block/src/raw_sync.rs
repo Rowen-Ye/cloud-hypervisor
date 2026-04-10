@@ -4,17 +4,17 @@
 
 use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{Seek, SeekFrom};
 use std::os::unix::io::{AsRawFd, RawFd};
 
+use libc::{FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE};
 use log::warn;
 use vmm_sys_util::eventfd::EventFd;
 
-use crate::DiskTopology;
-use crate::async_io::{
-    AsyncIo, AsyncIoError, AsyncIoResult, BorrowedDiskFd, DiskFile, DiskFileError, DiskFileResult,
-};
+use crate::async_io::{AsyncIo, AsyncIoError, AsyncIoResult, BorrowedDiskFd, DiskFileError};
+use crate::error::{BlockError, BlockErrorKind, BlockResult};
+use crate::{DiskTopology, SECTOR_SIZE, disk_file, probe_sparse_support, query_device_size};
 
+#[derive(Debug)]
 pub struct RawFileDiskSync {
     file: File,
 }
@@ -25,35 +25,67 @@ impl RawFileDiskSync {
     }
 }
 
-impl DiskFile for RawFileDiskSync {
-    fn logical_size(&mut self) -> DiskFileResult<u64> {
-        self.file
-            .seek(SeekFrom::End(0))
-            .map_err(DiskFileError::Size)
+impl disk_file::DiskSize for RawFileDiskSync {
+    fn logical_size(&self) -> BlockResult<u64> {
+        query_device_size(&self.file)
+            .map(|(logical_size, _)| logical_size)
+            .map_err(|e| BlockError::new(BlockErrorKind::Io, DiskFileError::Size(e)))
     }
+}
 
-    fn physical_size(&mut self) -> DiskFileResult<u64> {
-        self.file
-            .metadata()
-            .map(|m| m.len())
-            .map_err(DiskFileError::Size)
+impl disk_file::PhysicalSize for RawFileDiskSync {
+    fn physical_size(&self) -> BlockResult<u64> {
+        query_device_size(&self.file)
+            .map(|(_, physical_size)| physical_size)
+            .map_err(|e| BlockError::new(BlockErrorKind::Io, DiskFileError::Size(e)))
     }
+}
 
-    fn new_async_io(&self, _ring_depth: u32) -> DiskFileResult<Box<dyn AsyncIo>> {
-        Ok(Box::new(RawFileSync::new(self.file.as_raw_fd())) as Box<dyn AsyncIo>)
+impl disk_file::DiskFd for RawFileDiskSync {
+    fn fd(&self) -> BorrowedDiskFd<'_> {
+        BorrowedDiskFd::new(self.file.as_raw_fd())
     }
+}
 
-    fn topology(&mut self) -> DiskTopology {
-        if let Ok(topology) = DiskTopology::probe(&self.file) {
-            topology
-        } else {
+impl disk_file::Geometry for RawFileDiskSync {
+    fn topology(&self) -> DiskTopology {
+        DiskTopology::probe(&self.file).unwrap_or_else(|_| {
             warn!("Unable to get device topology. Using default topology");
             DiskTopology::default()
-        }
+        })
+    }
+}
+
+impl disk_file::SparseCapable for RawFileDiskSync {
+    fn supports_sparse_operations(&self) -> bool {
+        probe_sparse_support(&self.file)
+    }
+}
+
+impl disk_file::Resizable for RawFileDiskSync {
+    fn resize(&mut self, size: u64) -> BlockResult<()> {
+        self.file
+            .set_len(size)
+            .map_err(|e| BlockError::new(BlockErrorKind::Io, DiskFileError::ResizeError(e)))
+    }
+}
+
+impl disk_file::DiskFile for RawFileDiskSync {}
+
+impl disk_file::AsyncDiskFile for RawFileDiskSync {
+    fn try_clone(&self) -> BlockResult<Box<dyn disk_file::AsyncDiskFile>> {
+        let file = self
+            .file
+            .try_clone()
+            .map_err(|e| BlockError::new(BlockErrorKind::Io, DiskFileError::Clone(e)))?;
+        Ok(Box::new(RawFileDiskSync { file }))
     }
 
-    fn fd(&mut self) -> BorrowedDiskFd<'_> {
-        BorrowedDiskFd::new(self.file.as_raw_fd())
+    fn new_async_io(&self, _ring_depth: u32) -> BlockResult<Box<dyn AsyncIo>> {
+        let mut raw = RawFileSync::new(self.file.as_raw_fd());
+        raw.alignment =
+            DiskTopology::probe(&self.file).map_or(SECTOR_SIZE, |t| t.logical_block_size);
+        Ok(Box::new(raw) as Box<dyn AsyncIo>)
     }
 }
 
@@ -61,6 +93,7 @@ pub struct RawFileSync {
     fd: RawFd,
     eventfd: EventFd,
     completion_list: VecDeque<(u64, i32)>,
+    alignment: u64,
 }
 
 impl RawFileSync {
@@ -69,6 +102,7 @@ impl RawFileSync {
             fd,
             eventfd: EventFd::new(libc::EFD_NONBLOCK).expect("Failed creating EventFd for RawFile"),
             completion_list: VecDeque::new(),
+            alignment: SECTOR_SIZE,
         }
     }
 }
@@ -76,6 +110,10 @@ impl RawFileSync {
 impl AsyncIo for RawFileSync {
     fn notifier(&self) -> &EventFd {
         &self.eventfd
+    }
+
+    fn alignment(&self) -> u64 {
+        self.alignment
     }
 
     fn read_vectored(
@@ -145,5 +183,83 @@ impl AsyncIo for RawFileSync {
 
     fn next_completed_request(&mut self) -> Option<(u64, i32)> {
         self.completion_list.pop_front()
+    }
+
+    fn punch_hole(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()> {
+        let mode = FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE;
+
+        // SAFETY: FFI call with valid arguments
+        let result = unsafe {
+            libc::fallocate(
+                self.fd as libc::c_int,
+                mode,
+                offset as libc::off_t,
+                length as libc::off_t,
+            )
+        };
+        if result < 0 {
+            return Err(AsyncIoError::PunchHole(std::io::Error::last_os_error()));
+        }
+
+        self.completion_list.push_back((user_data, result));
+        self.eventfd.write(1).unwrap();
+
+        Ok(())
+    }
+
+    fn write_zeroes(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()> {
+        let mode = FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE;
+
+        // SAFETY: FFI call with valid arguments
+        let result = unsafe {
+            libc::fallocate(
+                self.fd as libc::c_int,
+                mode,
+                offset as libc::off_t,
+                length as libc::off_t,
+            )
+        };
+        if result < 0 {
+            return Err(AsyncIoError::WriteZeroes(std::io::Error::last_os_error()));
+        }
+
+        self.completion_list.push_back((user_data, result));
+        self.eventfd.write(1).unwrap();
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use std::os::unix::io::AsRawFd;
+
+    use vmm_sys_util::tempfile::TempFile;
+
+    use super::*;
+    use crate::raw_async_io_tests;
+
+    #[test]
+    fn test_punch_hole() {
+        let temp_file = TempFile::new().unwrap();
+        let mut file = temp_file.into_file();
+        let mut async_io = RawFileSync::new(file.as_raw_fd());
+        raw_async_io_tests::test_punch_hole(&mut async_io, &mut file);
+    }
+
+    #[test]
+    fn test_write_zeroes() {
+        let temp_file = TempFile::new().unwrap();
+        let mut file = temp_file.into_file();
+        let mut async_io = RawFileSync::new(file.as_raw_fd());
+        raw_async_io_tests::test_write_zeroes(&mut async_io, &mut file);
+    }
+
+    #[test]
+    fn test_punch_hole_multiple_operations() {
+        let temp_file = TempFile::new().unwrap();
+        let mut file = temp_file.into_file();
+        let mut async_io = RawFileSync::new(file.as_raw_fd());
+        raw_async_io_tests::test_punch_hole_multiple_operations(&mut async_io, &mut file);
     }
 }

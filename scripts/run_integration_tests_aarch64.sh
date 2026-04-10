@@ -13,7 +13,7 @@ build_virtiofsd() {
     VIRTIOFSD_DIR="$WORKLOADS_DIR/virtiofsd_build"
     VIRTIOFSD_REPO="https://gitlab.com/virtio-fs/virtiofsd.git"
 
-    checkout_repo "$VIRTIOFSD_DIR" "$VIRTIOFSD_REPO" v1.13.3 "bbf82173682a3e48083771a0a23331e5c23b4924"
+    checkout_repo "$VIRTIOFSD_DIR" "$VIRTIOFSD_REPO" main "0f5865629dc995a3e9d5a73b4eb45bb91740bccb"
 
     if [ ! -f "$VIRTIOFSD_DIR/.built" ]; then
         pushd "$VIRTIOFSD_DIR" || exit
@@ -26,7 +26,7 @@ build_virtiofsd() {
 }
 
 update_workloads() {
-    cp scripts/sha1sums-aarch64 "$WORKLOADS_DIR"
+    cp scripts/sha1sums-aarch64-common "$WORKLOADS_DIR"
 
     FOCAL_OS_RAW_IMAGE_NAME="focal-server-cloudimg-arm64-custom-20210929-0.raw"
     FOCAL_OS_RAW_IMAGE_DOWNLOAD_URL="https://ch-images.azureedge.net/$FOCAL_OS_RAW_IMAGE_NAME"
@@ -138,7 +138,7 @@ update_workloads() {
 
     pushd "$WORKLOADS_DIR" || exit
 
-    if ! sha1sum sha1sums-aarch64 --check; then
+    if ! sha1sum sha1sums-aarch64-common --check; then
         echo "sha1sum validation of images failed, remove invalid images to fix the issue."
         exit 1
     fi
@@ -285,7 +285,7 @@ fi
 
 # Run tests on dbus_api
 if [ $RES -eq 0 ]; then
-    cargo build --features "dbus_api" --all --release --target "$BUILD_TARGET"
+    cargo build --features "mshv,dbus_api" --all --release --target "$BUILD_TARGET"
     export RUST_BACKTRACE=1
     # integration tests now do not reply on build feature "dbus_api"
     time cargo nextest run $test_features --retries 3 --no-fail-fast --no-tests=pass --test-threads=$(($(nproc) / 4)) "dbus_api::$test_filter" -- ${test_binary_args[*]}
@@ -294,14 +294,14 @@ fi
 
 # Run tests on fw_cfg
 if [ $RES -eq 0 ]; then
-    cargo build --features "fw_cfg" --all --release --target "$BUILD_TARGET"
+    cargo build --features "mshv,fw_cfg" --all --release --target "$BUILD_TARGET"
     export RUST_BACKTRACE=1
     time cargo nextest run $test_features --retries 3 --no-fail-fast --no-tests=pass --test-threads=$(($(nproc) / 4)) "fw_cfg::$test_filter" -- ${test_binary_args[*]}
     RES=$?
 fi
 
 if [ $RES -eq 0 ]; then
-    cargo build --features "ivshmem" --all --release --target "$BUILD_TARGET"
+    cargo build --features "mshv,ivshmem" --all --release --target "$BUILD_TARGET"
     export RUST_BACKTRACE=1
     time cargo nextest run $test_features --retries 3 --no-fail-fast --no-tests=pass --test-threads=$(($(nproc) / 4)) "ivshmem::$test_filter" -- ${test_binary_args[*]}
 

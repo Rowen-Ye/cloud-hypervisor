@@ -277,6 +277,28 @@ paths:
         500:
           description: The new device could not be added to the VM instance.
 
+  /vm.add-generic-vhost-user:
+    put:
+      summary: Add a new generic vhost-user device to the VM
+      requestBody:
+        description: The details of the new generic vhost-user device
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GenericVhostUserConfig"
+        required: true
+      responses:
+        200:
+          description: The new device was successfully added to the VM instance.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PciDeviceInfo"
+        204:
+          description: The new device was successfully (cold) added to the VM instance.
+        500:
+          description: The new device could not be added to the VM instance.
+
   /vm.add-pmem:
     put:
       summary: Add a new pmem device to the VM
@@ -498,6 +520,10 @@ components:
             type: string
       description: Virtual Machine Monitor information
 
+    VmState:
+      type: string
+      enum: [Created, Running, Shutdown, Paused]
+
     VmInfo:
       required:
         - config
@@ -507,8 +533,8 @@ components:
         config:
           $ref: "#/components/schemas/VmConfig"
         state:
-          type: string
-          enum: [Created, Running, Shutdown, Paused]
+          $ref: "#/components/schemas/VmState"
+
         memory_actual_size:
           type: integer
           format: int64
@@ -603,6 +629,10 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/FsConfig"
+        generic-vhost-user:
+          type: array
+          items:
+            $ref: "#/components/schemas/GenericVhostUserConfig"
         pmem:
           type: array
           items:
@@ -684,6 +714,11 @@ components:
         packages:
           type: integer
 
+    CoreSchedulingMode:
+      type: string
+      enum: ["Vm", "Vcpu", "Off"]
+      default: "Vm"
+
     CpusConfig:
       required:
         - boot_vcpus
@@ -703,12 +738,18 @@ components:
           default: false
         max_phys_bits:
           type: integer
+        nested:
+          type: boolean
+          default: true
         affinity:
           type: array
           items:
             $ref: "#/components/schemas/CpuAffinity"
         features:
           $ref: "#/components/schemas/CpuFeatures"
+        core_scheduling:
+          $ref: "#/components/schemas/CoreSchedulingMode"
+
 
     PciSegmentConfig:
       required:
@@ -898,6 +939,15 @@ components:
           items:
             type: integer
 
+    ImageType:
+      type: string
+      enum: ["FixedVhd", "Qcow2", "Raw", "Vhdx", "Unknown"]
+
+    LockGranularity:
+      type: string
+      enum: [ByteRange, Full]
+      default: ByteRange
+
     DiskConfig:
       type: object
       properties:
@@ -938,6 +988,16 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/VirtQueueAffinity"
+        backing_files:
+          type: boolean
+          default: false
+        sparse:
+          type: boolean
+          default: true
+        image_type:
+          $ref: "#/components/schemas/ImageType"
+        lock_granularity:
+          $ref: "#/components/schemas/LockGranularity"
 
     NetConfig:
       type: object
@@ -1044,6 +1104,26 @@ components:
         id:
           type: string
 
+    GenericVhostUserConfig:
+      required:
+        - queue_sizes
+        - socket
+        - tag
+        - virtio_id
+      type: object
+      properties:
+        socket:
+          type: string
+        queue_size:
+          type: array
+          items:
+            type: uint16
+        pci_segment:
+          type: integer
+          format: int16
+        virtio_id:
+          type: uint32
+
     PmemConfig:
       required:
         - file
@@ -1066,6 +1146,10 @@ components:
         id:
           type: string
 
+    ConsoleMode:
+      type: string
+      enum: ["Off", "Pty", "Tty", "File", "Socket", "Null"]
+
     ConsoleConfig:
       required:
         - mode
@@ -1076,8 +1160,7 @@ components:
         socket:
           type: string
         mode:
-          type: string
-          enum: ["Off", "Pty", "Tty", "File", "Socket", "Null"]
+          $ref: "#/components/schemas/ConsoleMode"
         iommu:
           type: boolean
           default: false
@@ -1090,8 +1173,7 @@ components:
         file:
           type: string
         mode:
-          type: string
-          enum: ["Off", "Pty", "Tty", "File", "Null"]
+          $ref: "#/components/schemas/ConsoleMode"
         iobase:
           type: integer
 
@@ -1203,6 +1285,8 @@ components:
           items:
             type: integer
             format: int32
+        device_id:
+          type: string
 
     VmResize:
       type: object
@@ -1258,6 +1342,11 @@ components:
         destination_url:
           type: string
 
+    MemoryRestoreMode:
+      type: string
+      enum: [Copy, OnDemand]
+      default: Copy
+
     RestoreConfig:
       required:
         - source_url
@@ -1266,6 +1355,10 @@ components:
         source_url:
           type: string
         prefault:
+          type: boolean
+        memory_restore_mode:
+          $ref: "#/components/schemas/MemoryRestoreMode"
+        resume:
           type: boolean
 
     ReceiveMigrationData:
@@ -1276,6 +1369,15 @@ components:
         receiver_url:
           type: string
 
+    TimeoutStrategy:
+      type: string
+      enum: ["Cancel", "Ignore"]
+      default: "Cancel"
+      description: >
+        The strategy to apply when the migration timeout is reached.
+        Cancel will abort the migration and keep the VM running on the source.
+        Ignore will proceed with the migration regardless of the downtime requirement.
+
     SendMigrationData:
       required:
         - destination_url
@@ -1285,6 +1387,34 @@ components:
           type: string
         local:
           type: boolean
+        downtime_ms:
+          type: integer
+          format: int64
+          minimum: 1
+          default: 300
+          description: >
+            The maximum downtime the migration aims for, in milliseconds.
+            Defaults to 300ms.
+        timeout_s:
+          type: integer
+          format: int64
+          minimum: 1
+          default: 3600
+          description: >
+            The timeout for the migration (maximum total duration), in seconds.
+            Defaults to 3600s (one hour).
+        timeout_strategy:
+          $ref: "#/components/schemas/TimeoutStrategy"
+        connections:
+          type: integer
+          format: int64
+          default: 1
+          minimum: 1
+          maximum: 128
+          description: >
+            The number of parallel TCP connections to use for migration.
+            Must be between 1 and 128. Multiple connections are not supported
+            with local UNIX-socket migration.
 
     VmAddUserDevice:
       required:

@@ -10,13 +10,13 @@ use std::net::IpAddr;
 use std::num::Wrapping;
 use std::ops::Deref;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Barrier};
 use std::{result, thread};
 
 use anyhow::anyhow;
 use event_monitor::event;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 #[cfg(not(fuzzing))]
 use net_util::virtio_features_to_tap_offload;
 use net_util::{
@@ -179,6 +179,7 @@ struct NetEpollHandler {
     // a restore as the vCPU thread isn't ready to handle the interrupt. This causes
     // issues when combined with VIRTIO_RING_F_EVENT_IDX interrupt suppression.
     driver_awake: bool,
+    device_status: Arc<AtomicU8>,
 }
 
 impl NetEpollHandler {
@@ -192,6 +193,9 @@ impl NetEpollHandler {
     }
 
     fn handle_rx_event(&mut self) -> result::Result<(), DeviceError> {
+        if self.needs_reset() {
+            return Ok(());
+        }
         let queue_evt = &self.queue_evt_pair.0;
         if let Err(e) = queue_evt.read() {
             error!("Failed to get rx queue event: {e:?}");
@@ -220,13 +224,43 @@ impl NetEpollHandler {
         Ok(())
     }
 
+    fn handle_queue_iterator_error(&mut self, err: &virtio_queue::Error) {
+        // The guest submitted a corrupted VirtQ request, and the error
+        // was logged during queue processing. We cannot just ignore the
+        // error, as the guest could continue spamming the VMM with bad
+        // requests, triggering excessive error logging. So we mark
+        // the device "NEEDS_RESET", effectively stopping all request
+        // processing (see self.needs_reset() usage) until the guest
+        // resets and reactivates the device.
+
+        warn!(
+            "Corrupted request detected (virtqueue error: {err:?}). \
+Setting device status to 'NEEDS_RESET' and stopping processing queues until reset."
+        );
+
+        self.device_status
+            .fetch_or(crate::DEVICE_NEEDS_RESET as u8, Ordering::SeqCst);
+
+        // Let the guest know that the device status has changed.
+        if let Err(e) = self.interrupt_cb.trigger(VirtioInterruptType::Config) {
+            error!("Failed to signal config interrupt: {e:?}");
+        }
+    }
+
     fn process_tx(&mut self) -> result::Result<(), DeviceError> {
-        if self
+        if self.needs_reset() {
+            return Ok(());
+        }
+        let res = self
             .net
-            .process_tx(&self.mem.memory(), &mut self.queue_pair.1)
-            .map_err(DeviceError::NetQueuePair)?
-            || !self.driver_awake
-        {
+            .process_tx(&self.mem.memory(), &mut self.queue_pair.1);
+
+        if let Err(net_util::NetQueuePairError::QueueIteratorFailed(err)) = res {
+            self.handle_queue_iterator_error(&err);
+            return Ok(());
+        }
+
+        if res.map_err(DeviceError::NetQueuePair)? || !self.driver_awake {
             self.signal_used_queue(self.queue_index_base + 1)?;
             debug!("Signalling TX queue");
         } else {
@@ -250,12 +284,19 @@ impl NetEpollHandler {
     }
 
     fn handle_rx_tap_event(&mut self) -> result::Result<(), DeviceError> {
-        if self
+        if self.needs_reset() {
+            return Ok(());
+        }
+        let res = self
             .net
-            .process_rx(&self.mem.memory(), &mut self.queue_pair.0)
-            .map_err(DeviceError::NetQueuePair)?
-            || !self.driver_awake
-        {
+            .process_rx(&self.mem.memory(), &mut self.queue_pair.0);
+
+        if let Err(net_util::NetQueuePairError::QueueIteratorFailed(err)) = res {
+            self.handle_queue_iterator_error(&err);
+            return Ok(());
+        }
+
+        if res.map_err(DeviceError::NetQueuePair)? || !self.driver_awake {
             self.signal_used_queue(self.queue_index_base)?;
             debug!("Signalling RX queue");
         } else {
@@ -304,6 +345,10 @@ impl NetEpollHandler {
         helper.run(paused, paused_sync, self)?;
 
         Ok(())
+    }
+
+    fn needs_reset(&self) -> bool {
+        (self.device_status.load(Ordering::Acquire) & crate::DEVICE_NEEDS_RESET as u8) != 0
     }
 }
 
@@ -414,6 +459,7 @@ pub struct Net {
     seccomp_action: SeccompAction,
     rate_limiter_config: Option<RateLimiterConfig>,
     exit_evt: EventFd,
+    device_status: Arc<AtomicU8>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -463,7 +509,7 @@ impl Net {
                 | (1 << VIRTIO_F_VERSION_1);
 
             if iommu {
-                avail_features |= 1u64 << VIRTIO_F_IOMMU_PLATFORM;
+                avail_features |= 1u64 << VIRTIO_F_ACCESS_PLATFORM;
             }
 
             // Configure TSO/UFO features when hardware checksum offload is enabled.
@@ -535,6 +581,7 @@ impl Net {
             seccomp_action,
             rate_limiter_config,
             exit_evt,
+            device_status: Arc::new(AtomicU8::new(0)),
         })
     }
 
@@ -693,17 +740,27 @@ impl VirtioDevice for Net {
         self.read_config_from_slice(self.config.as_slice(), offset, data);
     }
 
-    fn activate(
-        &mut self,
-        mem: GuestMemoryAtomic<GuestMemoryMmap>,
-        interrupt_cb: Arc<dyn VirtioInterrupt>,
-        mut queues: Vec<(usize, Queue, EventFd)>,
-    ) -> ActivateResult {
+    fn activate(&mut self, context: crate::device::ActivationContext) -> ActivateResult {
+        let crate::device::ActivationContext {
+            mem,
+            interrupt_cb,
+            mut queues,
+            device_status,
+        } = context;
+        self.device_status = device_status;
         self.common.activate(&queues, interrupt_cb.clone())?;
 
         let num_queues = queues.len();
         let event_idx = self.common.feature_acked(VIRTIO_RING_F_EVENT_IDX.into());
-        if self.common.feature_acked(VIRTIO_NET_F_CTRL_VQ.into()) && !num_queues.is_multiple_of(2) {
+
+        // Recompute the barrier size from the queues that are actually activated.
+        let has_ctrl_queue =
+            self.common.feature_acked(VIRTIO_NET_F_CTRL_VQ.into()) && !num_queues.is_multiple_of(2);
+        let ctrl_threads = if has_ctrl_queue { 1 } else { 0 };
+        let qp_threads = (num_queues - ctrl_threads) / 2;
+        self.common.paused_sync = Some(Arc::new(Barrier::new(1 + qp_threads + ctrl_threads)));
+
+        if has_ctrl_queue {
             let ctrl_queue_index = num_queues - 1;
             let (_, mut ctrl_queue, ctrl_queue_evt) = queues.remove(ctrl_queue_index);
 
@@ -723,10 +780,6 @@ impl VirtioDevice for Net {
             };
 
             let paused = self.common.paused.clone();
-            // Let's update the barrier as we need 1 for each RX/TX pair +
-            // 1 for the control queue + 1 for the main thread signalling
-            // the pause.
-            self.common.paused_sync = Some(Arc::new(Barrier::new(self.taps.len() + 2)));
             let paused_sync = self.common.paused_sync.clone();
 
             let mut epoll_threads = Vec::new();
@@ -803,6 +856,7 @@ impl VirtioDevice for Net {
                 kill_evt,
                 pause_evt,
                 driver_awake: false,
+                device_status: self.device_status.clone(),
             };
 
             let paused = self.common.paused.clone();

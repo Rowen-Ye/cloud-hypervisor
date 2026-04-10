@@ -8,20 +8,24 @@
 //
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
+use std::cmp::max;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::num::Wrapping;
 use std::ops::Deref;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::{io, result};
 
 use anyhow::anyhow;
-use block::async_io::{AsyncIo, AsyncIoError, DiskFile, DiskFileError};
-use block::fcntl::{LockError, LockGranularity, LockType, get_lock_state};
+use block::async_io::{AsyncIo, AsyncIoError};
+use block::disk_file::DiskBackend;
+use block::error::BlockError;
+use block::fcntl::{LockError, LockGranularity, LockGranularityChoice, LockType, get_lock_state};
 use block::{
-    ExecuteAsync, ExecuteError, Request, RequestType, VirtioBlockConfig, build_serial, fcntl,
+    ExecuteAsync, ExecuteError, MAX_DISCARD_WRITE_ZEROES_SEG, Request, RequestType,
+    VirtioBlockConfig, build_serial, fcntl,
 };
 use event_monitor::event;
 use log::{debug, error, info, warn};
@@ -104,7 +108,7 @@ pub enum Error {
     #[error("Failed signal config interrupt")]
     ConfigChange(#[source] io::Error),
     #[error("Disk resize failed")]
-    DiskResize(#[source] DiskFileError),
+    DiskResize(#[source] BlockError),
 }
 
 pub type Result<T> = result::Result<T, Error>;
@@ -160,6 +164,8 @@ struct BlockEpollHandler {
     access_platform: Option<Arc<dyn AccessPlatform>>,
     host_cpus: Option<Vec<usize>>,
     acked_features: u64,
+    disable_sector0_writes: bool,
+    device_status: Arc<AtomicU8>,
 }
 
 fn has_feature(features: u64, feature_flag: u64) -> bool {
@@ -167,31 +173,92 @@ fn has_feature(features: u64, feature_flag: u64) -> bool {
 }
 
 impl BlockEpollHandler {
-    fn check_request(features: u64, request_type: RequestType) -> result::Result<(), ExecuteError> {
-        if has_feature(features, VIRTIO_BLK_F_RO.into())
-            && !(request_type == RequestType::In || request_type == RequestType::GetDeviceId)
+    fn needs_reset(&self) -> bool {
+        (self.device_status.load(Ordering::Acquire) & crate::DEVICE_NEEDS_RESET as u8) != 0
+    }
+
+    fn check_request(
+        features: u64,
+        request: &Request,
+        disable_sector0_writes: bool,
+    ) -> result::Result<(), ExecuteError> {
+        let request_type = request.request_type;
+        if (has_feature(features, VIRTIO_BLK_F_RO.into()))
+            && !(request_type == RequestType::In
+                || request_type == RequestType::GetDeviceId
+                || request_type == RequestType::Flush)
         {
             // For virtio spec compliance
             // "A device MUST set the status byte to VIRTIO_BLK_S_IOERR for a write request
             // if the VIRTIO_BLK_F_RO feature if offered, and MUST NOT write any data."
+            warn!(
+                "Rejecting block request {request_type:?}: device is read-only (VIRTIO_BLK_F_RO negotiated)"
+            );
             return Err(ExecuteError::ReadOnly);
         }
+
+        if request_type == RequestType::Out && disable_sector0_writes && request.sector == 0 {
+            warn!(
+                "Attempting to write to sector 0 on a raw disk without specifying image_type=raw"
+            );
+            return Err(ExecuteError::ReadOnly);
+        }
+
         Ok(())
     }
 
+    fn handle_queue_iterator_error(&mut self, err: &virtio_queue::Error) {
+        // The guest submitted a corrupted VirtQ request, and the error
+        // was logged during queue processing. We cannot just ignore the
+        // error, as the guest could continue spamming the VMM with bad
+        // requests, triggering excessive error logging. So we mark
+        // the device "NEEDS_RESET", effectively stopping all request
+        // processing (see self.needs_reset() usage) until the guest
+        // resets and reactivates the device.
+
+        warn!(
+            "Corrupted request detected (virtqueue error: {err:?}). \
+Setting device status to 'NEEDS_RESET' and stopping processing queues until reset."
+        );
+
+        self.device_status
+            .fetch_or(crate::DEVICE_NEEDS_RESET as u8, Ordering::SeqCst);
+
+        // Let the guest know that the device status has changed.
+        if let Err(e) = self.interrupt_cb.trigger(VirtioInterruptType::Config) {
+            error!("Failed to signal config interrupt: {e:?}");
+        }
+    }
+
     fn process_queue_submit(&mut self) -> Result<()> {
+        if self.needs_reset() {
+            return Ok(());
+        }
         let queue = &mut self.queue;
         let mut batch_requests = Vec::new();
         let mut batch_inflight_requests = Vec::new();
 
-        while let Some(mut desc_chain) = queue.pop_descriptor_chain(self.mem.memory()) {
+        loop {
+            let mut desc_chain = match queue.iter(self.mem.memory()) {
+                Ok(mut iter) => match iter.next() {
+                    Some(c) => c,
+                    None => break,
+                },
+                Err(err) => {
+                    self.handle_queue_iterator_error(&err);
+                    return Ok(());
+                }
+            };
             let mut request = Request::parse(&mut desc_chain, self.access_platform.as_deref())
                 .map_err(Error::RequestParsing)?;
 
             // For virtio spec compliance
             // "A device MUST set the status byte to VIRTIO_BLK_S_IOERR for a write request
             // if the VIRTIO_BLK_F_RO feature if offered, and MUST NOT write any data."
-            if let Err(e) = Self::check_request(self.acked_features, request.request_type) {
+            // Also, if sector 0 writes are disabled, treat writes to sector 0 as read-only as well.
+            if let Err(e) =
+                Self::check_request(self.acked_features, &request, self.disable_sector0_writes)
+            {
                 warn!("Request check failed: {request:x?} {e:?}");
                 desc_chain
                     .memory()
@@ -247,6 +314,7 @@ impl BlockEpollHandler {
                 self.disk_nsectors.load(Ordering::SeqCst),
                 self.disk_image.as_mut(),
                 &self.serial,
+                self.disable_sector0_writes,
                 desc_chain.head_index() as u64,
             );
 
@@ -272,7 +340,7 @@ impl BlockEpollHandler {
                     Ok(_) => VIRTIO_BLK_S_OK,
                     Err(e) => {
                         warn!("Request failed: {request:x?} {e:?}");
-                        VIRTIO_BLK_S_IOERR
+                        e.status() as u32
                     }
                 };
 
@@ -363,6 +431,9 @@ impl BlockEpollHandler {
     }
 
     fn process_queue_complete(&mut self) -> Result<()> {
+        if self.needs_reset() {
+            return Ok(());
+        }
         let mem = self.mem.memory();
         let mut read_bytes = Wrapping(0);
         let mut write_bytes = Wrapping(0);
@@ -590,17 +661,14 @@ impl EpollHelperHandler for BlockEpollHandler {
                     ))
                 })?;
 
+                self.try_signal_used_queue()?;
+
                 let rate_limit_reached = self.rate_limiter.as_ref().is_some_and(|r| r.is_blocked());
 
                 // Process the queue only when the rate limit is not reached
                 if !rate_limit_reached {
-                    self.process_queue_submit().map_err(|e| {
-                        EpollHelperError::HandleEvent(anyhow!(
-                            "Failed to process queue (submit): {e:?}"
-                        ))
-                    })?;
+                    self.process_queue_submit_and_signal()?;
                 }
-                self.try_signal_used_queue()?;
             }
             RATE_LIMITER_EVENT => {
                 if let Some(rate_limiter) = &mut self.rate_limiter {
@@ -633,7 +701,7 @@ impl EpollHelperHandler for BlockEpollHandler {
 pub struct Block {
     common: VirtioCommon,
     id: String,
-    disk_image: Box<dyn DiskFile>,
+    disk_image: DiskBackend,
     disk_path: PathBuf,
     disk_nsectors: Arc<AtomicU64>,
     config: VirtioBlockConfig,
@@ -644,6 +712,9 @@ pub struct Block {
     exit_evt: EventFd,
     serial: Vec<u8>,
     queue_affinity: BTreeMap<u16, Vec<usize>>,
+    disable_sector0_writes: bool,
+    lock_granularity_choice: LockGranularityChoice,
+    device_status: Arc<AtomicU8>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -660,7 +731,7 @@ impl Block {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: String,
-        mut disk_image: Box<dyn DiskFile>,
+        mut disk_image: DiskBackend,
         disk_path: PathBuf,
         read_only: bool,
         iommu: bool,
@@ -672,6 +743,9 @@ impl Block {
         exit_evt: EventFd,
         state: Option<BlockState>,
         queue_affinity: BTreeMap<u16, Vec<usize>>,
+        sparse: bool,
+        disable_sector0_writes: bool,
+        lock_granularity: LockGranularityChoice,
     ) -> io::Result<Self> {
         let (disk_nsectors, avail_features, acked_features, config, paused) =
             if let Some(state) = state {
@@ -702,8 +776,25 @@ impl Block {
                     | (1u64 << VIRTIO_BLK_F_SEG_MAX)
                     | (1u64 << VIRTIO_RING_F_EVENT_IDX)
                     | (1u64 << VIRTIO_RING_F_INDIRECT_DESC);
+
+                // When backend supports sparse operations:
+                // - Always advertise WRITE_ZEROES (safe for all drivers)
+                // - Advertise DISCARD only when sparse=true, since DISCARD
+                //   deallocates space via punch_hole and should require
+                //   explicit user opt in.
+                let mut discard_supported = false;
+                if disk_image.supports_sparse_operations() {
+                    avail_features |= 1u64 << VIRTIO_BLK_F_WRITE_ZEROES;
+                    if sparse {
+                        avail_features |= 1u64 << VIRTIO_BLK_F_DISCARD;
+                        discard_supported = true;
+                    }
+                } else if sparse {
+                    warn!("sparse=on requested but backend does not support sparse operations");
+                }
+
                 if iommu {
-                    avail_features |= 1u64 << VIRTIO_F_IOMMU_PLATFORM;
+                    avail_features |= 1u64 << VIRTIO_F_ACCESS_PLATFORM;
                 }
 
                 if read_only {
@@ -739,6 +830,17 @@ impl Block {
                     ..Default::default()
                 };
 
+                if avail_features & (1u64 << VIRTIO_BLK_F_WRITE_ZEROES) != 0 {
+                    config.max_write_zeroes_sectors = u32::MAX;
+                    config.max_write_zeroes_seg = MAX_DISCARD_WRITE_ZEROES_SEG;
+                    config.write_zeroes_may_unmap = if discard_supported { 1 } else { 0 };
+                }
+                if avail_features & (1u64 << VIRTIO_BLK_F_DISCARD) != 0 {
+                    config.max_discard_sectors = u32::MAX;
+                    config.max_discard_seg = MAX_DISCARD_WRITE_ZEROES_SEG;
+                    config.discard_sector_alignment = (logical_block_size / SECTOR_SIZE) as u32;
+                }
+
                 if num_queues > 1 {
                     avail_features |= 1u64 << VIRTIO_BLK_F_MQ;
                     config.num_queues = num_queues as u16;
@@ -772,6 +874,9 @@ impl Block {
             exit_evt,
             serial,
             queue_affinity,
+            disable_sector0_writes,
+            lock_granularity_choice: lock_granularity,
+            device_status: Arc::new(AtomicU8::new(0)),
         })
     }
 
@@ -780,23 +885,32 @@ impl Block {
     }
 
     /// Returns the granularity for the advisory lock for this disk.
-    // TODO In future, we could add a `lock_granularity=` configuration to the CLI.
-    // For now, we stick to QEMU behavior.
     fn lock_granularity(&mut self) -> LockGranularity {
-        self.disk_image.physical_size().map_or_else(
-            // use a safe fallback
-            |e| {
-                let fallback = LockGranularity::WholeFile;
-                warn!(
-                    "Can't get disk size for id={},path={}, falling back to {:?}: error: {e}",
-                    self.id,
-                    self.disk_path.display(),
-                    fallback
-                );
-                fallback
-            },
-            |size| LockGranularity::ByteRange(0, size),
-        )
+        match self.lock_granularity_choice {
+            LockGranularityChoice::Full => LockGranularity::WholeFile,
+            LockGranularityChoice::ByteRange => {
+                // Byte range lock covering [0, max(logical, physical))
+                // logical > physical for sparse files, physical > logical
+                // for small dense files due to filesystem block rounding.
+                let logical = self.disk_image.logical_size();
+                let physical = self.disk_image.physical_size();
+                match (logical, physical) {
+                    (Ok(l), Ok(p)) => LockGranularity::ByteRange(0, max(l, p)),
+                    (Ok(l), Err(_)) => LockGranularity::ByteRange(0, l),
+                    (Err(_), Ok(p)) => LockGranularity::ByteRange(0, p),
+                    (Err(e), Err(_)) => {
+                        let fallback = LockGranularity::WholeFile;
+                        warn!(
+                            "Can't get disk size for id={},path={}, falling back to {:?}: error: {e}",
+                            self.id,
+                            self.disk_path.display(),
+                            fallback
+                        );
+                        fallback
+                    }
+                }
+            }
+        }
     }
 
     /// Tries to set an advisory lock for the corresponding disk image.
@@ -860,24 +974,24 @@ impl Block {
         }
     }
 
-    fn update_writeback(&mut self) {
-        // Use writeback from config if VIRTIO_BLK_F_CONFIG_WCE
-        let writeback = if self.common.feature_acked(VIRTIO_BLK_F_CONFIG_WCE.into()) {
-            self.config.writeback == 1
-        } else {
-            // Else check if VIRTIO_BLK_F_FLUSH negotiated
-            self.common.feature_acked(VIRTIO_BLK_F_FLUSH.into())
-        };
+    /// The virtio v1.2 spec says "If VIRTIO_BLK_F_CONFIG_WCE was not
+    /// negotiated but VIRTIO_BLK_F_FLUSH was, the driver SHOULD assume
+    /// presence of a writeback cache." It also says "If
+    /// VIRTIO_BLK_F_CONFIG_WCE is negotiated but VIRTIO_BLK_F_FLUSH is not,
+    /// the device MUST initialize writeback to 0."
+    fn is_writeback_enabled(&self, desired: bool) -> bool {
+        let flush = self.common.feature_acked(VIRTIO_BLK_F_FLUSH.into());
+        let wce = self.common.feature_acked(VIRTIO_BLK_F_CONFIG_WCE.into());
+        if wce { flush && desired } else { flush }
+    }
 
+    fn set_writeback_mode(&mut self, enabled: bool) {
+        self.config.writeback = enabled as u8;
+        self.writeback.store(enabled, Ordering::Release);
         info!(
             "Changing cache mode to {}",
-            if writeback {
-                "writeback"
-            } else {
-                "writethrough"
-            }
+            if enabled { "writeback" } else { "writethrough" }
         );
-        self.writeback.store(writeback, Ordering::Release);
     }
 
     pub fn resize(&mut self, new_size: u64) -> Result<()> {
@@ -959,19 +1073,32 @@ impl VirtioDevice for Block {
             return;
         }
 
-        self.config.writeback = data[0];
-        self.update_writeback();
+        let writeback = self.is_writeback_enabled(data[0] == 1);
+        self.set_writeback_mode(writeback);
     }
 
-    fn activate(
-        &mut self,
-        mem: GuestMemoryAtomic<GuestMemoryMmap>,
-        interrupt_cb: Arc<dyn VirtioInterrupt>,
-        mut queues: Vec<(usize, Queue, EventFd)>,
-    ) -> ActivateResult {
+    fn activate(&mut self, context: crate::device::ActivationContext) -> ActivateResult {
+        let crate::device::ActivationContext {
+            mem,
+            interrupt_cb,
+            mut queues,
+            device_status,
+        } = context;
+        self.device_status = device_status;
+        // See if the guest didn't ack the device being read-only.
+        // If so, warn and pretend it did.
+        let original_acked_features = self.common.acked_features;
+        self.common.acked_features |= self.common.avail_features & (1u64 << VIRTIO_BLK_F_RO);
+        if original_acked_features != self.common.acked_features {
+            warn!("Guest did not acknowledge that device is read-only, acting as if it did!");
+        }
         self.common.activate(&queues, interrupt_cb.clone())?;
 
-        self.update_writeback();
+        // Recompute the barrier size from the queues that are actually activated.
+        self.common.paused_sync = Some(Arc::new(Barrier::new(queues.len() + 1)));
+
+        let writeback = self.is_writeback_enabled(self.config.writeback == 1);
+        self.set_writeback_mode(writeback);
 
         let mut epoll_threads = Vec::new();
         let event_idx = self.common.feature_acked(VIRTIO_RING_F_EVENT_IDX.into());
@@ -1016,6 +1143,8 @@ impl VirtioDevice for Block {
                 access_platform: self.common.access_platform.clone(),
                 host_cpus: self.queue_affinity.get(&queue_idx).cloned(),
                 acked_features: self.common.acked_features,
+                disable_sector0_writes: self.disable_sector0_writes,
+                device_status: self.device_status.clone(),
             };
 
             let paused = self.common.paused.clone();
@@ -1039,6 +1168,7 @@ impl VirtioDevice for Block {
 
     fn reset(&mut self) -> Option<Arc<dyn VirtioInterrupt>> {
         let result = self.common.reset();
+        self.set_writeback_mode(true);
         event!("virtio-device", "reset", "id", &self.id);
         result
     }

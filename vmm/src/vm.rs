@@ -11,7 +11,7 @@
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 //
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
@@ -19,7 +19,7 @@ use std::mem::size_of;
 use std::num::Wrapping;
 use std::ops::Deref;
 use std::os::unix::net::UnixStream;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 #[cfg(not(target_arch = "riscv64"))]
 use std::time::Instant;
 use std::{cmp, result, str, thread};
@@ -58,17 +58,17 @@ use linux_loader::loader::bzimage::BzImage;
 use linux_loader::loader::elf::PvhBootCapability::PvhEntryPresent;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use linux_loader::loader::pe::Error::InvalidImageMagicNumber;
-use log::{error, info};
+use log::{error, info, warn};
 use seccompiler::SeccompAction;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracer::trace_scoped;
 use vm_device::Bus;
 #[cfg(feature = "tdx")]
+use vm_memory::GuestMemory;
+#[cfg(feature = "tdx")]
 use vm_memory::{Address, ByteValued, GuestMemoryRegion, ReadVolatile};
-use vm_memory::{
-    Bytes, GuestAddress, GuestAddressSpace, GuestMemory, GuestMemoryAtomic, WriteVolatile,
-};
+use vm_memory::{Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic};
 use vm_migration::protocol::{MemoryRangeTable, Request, Response};
 use vm_migration::{
     Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable, snapshot_from_id,
@@ -76,7 +76,7 @@ use vm_migration::{
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
-use crate::config::{ValidationError, add_to_config};
+use crate::config::{MemoryRestoreMode, ValidationError, add_to_config};
 use crate::console_devices::{ConsoleDeviceError, ConsoleInfo};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::coredump::{
@@ -100,8 +100,8 @@ use crate::migration::{SNAPSHOT_CONFIG_FILE, SNAPSHOT_STATE_FILE, url_to_path};
 #[cfg(feature = "fw_cfg")]
 use crate::vm_config::FwCfgConfig;
 use crate::vm_config::{
-    DeviceConfig, DiskConfig, FsConfig, HotplugMethod, NetConfig, NumaConfig, PayloadConfig,
-    PmemConfig, UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
+    DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, HotplugMethod, NetConfig,
+    NumaConfig, PayloadConfig, PmemConfig, UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
 };
 use crate::{
     CPU_MANAGER_SNAPSHOT_ID, DEVICE_MANAGER_SNAPSHOT_ID, GuestMemoryMmap,
@@ -149,9 +149,6 @@ pub enum Error {
     #[cfg(target_arch = "aarch64")]
     #[error("Cannot enable interrupt controller")]
     EnableInterruptController(#[source] interrupt_controller::Error),
-
-    #[error("VM state is poisoned")]
-    PoisonedState,
 
     #[error("Error from device manager")]
     DeviceManager(#[source] DeviceManagerError),
@@ -511,7 +508,7 @@ pub struct Vm {
     threads: Vec<thread::JoinHandle<()>>,
     device_manager: Arc<Mutex<DeviceManager>>,
     config: Arc<Mutex<VmConfig>>,
-    state: RwLock<VmState>,
+    state: VmState,
     cpu_manager: Arc<Mutex<cpu::CpuManager>>,
     memory_manager: Arc<Mutex<MemoryManager>>,
     #[cfg_attr(any(not(feature = "kvm"), target_arch = "aarch64"), allow(dead_code))]
@@ -563,21 +560,10 @@ impl Vm {
         let numa_nodes =
             Self::create_numa_nodes(config.lock().unwrap().numa.as_deref(), &memory_manager)?;
 
-        #[cfg(feature = "tdx")]
-        let tdx_enabled = config.lock().unwrap().is_tdx_enabled();
-        #[cfg(feature = "sev_snp")]
-        let sev_snp_enabled = config.lock().unwrap().is_sev_snp_enabled();
-        #[cfg(feature = "tdx")]
-        let force_iommu = tdx_enabled;
-        #[cfg(feature = "sev_snp")]
-        let force_iommu = sev_snp_enabled;
-        #[cfg(not(any(feature = "tdx", feature = "sev_snp")))]
-        let force_iommu = false;
+        // Determine if IOMMU should be forced based on confidential computing features
+        let force_iommu = Self::should_force_iommu(&config);
 
-        #[cfg(feature = "guest_debug")]
-        let stop_on_boot = config.lock().unwrap().gdb;
-        #[cfg(not(feature = "guest_debug"))]
-        let stop_on_boot = false;
+        let stop_on_boot = Self::should_stop_on_boot(&config);
 
         let memory = memory_manager.lock().unwrap().guest_memory();
         let io_bus = Arc::new(Bus::new());
@@ -590,63 +576,26 @@ impl Vm {
             mmio_bus: mmio_bus.clone(),
         });
 
-        let cpus_config = { &config.lock().unwrap().cpus.clone() };
-        let cpu_manager = cpu::CpuManager::new(
-            cpus_config,
+        // Create CPU manager
+        let cpu_manager = Self::create_cpu_manager(
+            &config,
             vm.clone(),
             exit_evt.try_clone().map_err(Error::EventFdClone)?,
             reset_evt.try_clone().map_err(Error::EventFdClone)?,
             #[cfg(feature = "guest_debug")]
             vm_debug_evt,
-            hypervisor.clone(),
+            &hypervisor,
             seccomp_action.clone(),
             vm_ops,
-            #[cfg(feature = "tdx")]
-            tdx_enabled,
             &numa_nodes,
-            #[cfg(feature = "sev_snp")]
-            sev_snp_enabled,
-        )
-        .map_err(Error::CpuManager)?;
+        )?;
 
-        #[cfg(target_arch = "x86_64")]
-        cpu_manager
-            .lock()
-            .unwrap()
-            .populate_cpuid(
-                hypervisor.as_ref(),
-                #[cfg(feature = "tdx")]
-                tdx_enabled,
-            )
-            .map_err(Error::CpuManager)?;
-
-        // The initial TDX configuration must be done before the vCPUs are
-        // created
+        // Perform hypervisor-specific TDX initialization if enabled
         #[cfg(feature = "tdx")]
-        if tdx_enabled {
-            let cpuid = cpu_manager.lock().unwrap().common_cpuid();
-            let max_vcpus = cpu_manager.lock().unwrap().max_vcpus();
-            vm.tdx_init(&cpuid, max_vcpus)
-                .map_err(Error::InitializeTdxVm)?;
-        }
+        Self::init_tdx_if_enabled(&config, &vm, &cpu_manager)?;
 
-        #[cfg(feature = "tdx")]
-        let dynamic = !tdx_enabled;
-        #[cfg(not(feature = "tdx"))]
-        let dynamic = true;
-
-        #[cfg(feature = "kvm")]
-        let is_kvm = matches!(
-            hypervisor.hypervisor_type(),
-            hypervisor::HypervisorType::Kvm
-        );
-        #[cfg(feature = "mshv")]
-        let is_mshv = matches!(
-            hypervisor.hypervisor_type(),
-            hypervisor::HypervisorType::Mshv
-        );
-
-        let device_manager = DeviceManager::new(
+        // Create device manager
+        let device_manager = Self::create_device_manager(
             io_bus,
             mmio_bus,
             vm.clone(),
@@ -662,190 +611,24 @@ impl Vm {
             boot_id_list,
             #[cfg(not(target_arch = "riscv64"))]
             timestamp,
-            snapshot_from_id(snapshot, DEVICE_MANAGER_SNAPSHOT_ID),
-            dynamic,
-        )
-        .map_err(Error::DeviceManager)?;
+            snapshot,
+        )?;
 
-        // Initialize the VM now that we have created the device manager.
-        // For MSHV and non aarch64, we need to initialize the VM before creating vCPUs.
-        // For aarch64, we need to initialize the VM after creating interrupt controller.
-        // Push down write after the IC(Interrupt Controller) creation for MSHV aarch64.
-        #[cfg(all(feature = "mshv", not(target_arch = "aarch64")))]
-        {
-            if is_mshv {
-                vm.init().map_err(Error::InitializeVm)?;
-            }
-        }
-        #[cfg(feature = "sev_snp")]
-        if sev_snp_enabled {
-            cpu_manager
-                .lock()
-                .unwrap()
-                .create_boot_vcpus(snapshot_from_id(snapshot, CPU_MANAGER_SNAPSHOT_ID))
-                .map_err(Error::CpuManager)?;
+        // Perform hypervisor-specific initialization
+        let load_payload_handle = Self::hypervisor_specific_init(
+            &vm,
+            &memory_manager,
+            &cpu_manager,
+            &device_manager,
+            &config,
+            &hypervisor,
+            console_info.as_ref(),
+            console_resize_pipe.as_ref(),
+            &original_termios,
+            snapshot,
+        )?;
 
-            // This initial SEV-SNP configuration must be done immediately after
-            // vCPUs are created. As part of this initialization we are
-            // transitioning the guest into secure state.
-            vm.sev_snp_init().map_err(Error::InitializeSevSnpVm)?;
-        }
-
-        #[cfg(feature = "sev_snp")]
-        // Loading the igvm file is pushed down here because
-        // igvm parser needs cpu_manager to retrieve cpuid leaf.
-        // Currently, Microsoft Hypervisor does not provide any
-        // Hypervisor specific common cpuid, we need to call get_cpuid_values
-        // per cpuid through cpu_manager.
-        let _load_payload_handle = if snapshot.is_none() && sev_snp_enabled {
-            Self::load_payload_async(
-                &memory_manager,
-                &config,
-                #[cfg(feature = "igvm")]
-                &cpu_manager,
-                #[cfg(feature = "sev_snp")]
-                sev_snp_enabled,
-            )?
-        } else {
-            None
-        };
-
-        #[cfg(feature = "mshv")]
-        {
-            if is_mshv {
-                let ic = device_manager
-                    .lock()
-                    .unwrap()
-                    .create_interrupt_controller()
-                    .map_err(Error::DeviceManager)?;
-                #[cfg(target_arch = "aarch64")]
-                vm.init().map_err(Error::InitializeVm)?;
-                device_manager
-                    .lock()
-                    .unwrap()
-                    .create_devices(
-                        console_info.clone(),
-                        console_resize_pipe.clone(),
-                        original_termios.clone(),
-                        ic,
-                    )
-                    .map_err(Error::DeviceManager)?;
-            }
-        }
-        cfg_if::cfg_if! {
-            if #[cfg(feature = "sev_snp")] {
-                if !sev_snp_enabled {
-                    memory_manager
-                        .lock()
-                        .unwrap()
-                        .allocate_address_space()
-                        .map_err(Error::MemoryManager)?;
-                }
-            } else {
-                memory_manager
-                    .lock()
-                    .unwrap()
-                    .allocate_address_space()
-                    .map_err(Error::MemoryManager)?;
-            }
-        }
-
-        #[cfg(target_arch = "aarch64")]
-        memory_manager
-            .lock()
-            .unwrap()
-            .add_uefi_flash()
-            .map_err(Error::MemoryManager)?;
-
-        // First case is when sev_snp is enabled(compiled), but run time non-cvn
-        // guest boot. 2nd case is when sev_snp is not compiled in, KVM and MSHV regular guest boot.
-        cfg_if::cfg_if! {
-            if #[cfg(feature = "sev_snp")] {
-                let _load_payload_handle = if snapshot.is_none() && !sev_snp_enabled {
-                    Self::load_payload_async(
-                        &memory_manager,
-                        &config,
-                        #[cfg(feature = "igvm")]
-                        &cpu_manager,
-                        #[cfg(feature = "sev_snp")]
-                        sev_snp_enabled,
-                    )?
-                } else {
-                    None
-                };
-            } else {
-                let _load_payload_handle = if snapshot.is_none() {
-                    Self::load_payload_async(
-                        &memory_manager,
-                        &config,
-                        #[cfg(feature = "igvm")]
-                        &cpu_manager,
-                    )?
-                } else {
-                    None
-                };
-            }
-        }
-
-        // First case is when sev_snp is enabled(compiled), but run time non-cvn
-        // guest boot. 2nd case is when sev_snp is not compiled in, KVM and MSHV regular guest boot.
-        cfg_if::cfg_if! {
-            if #[cfg(feature = "sev_snp")] {
-                if !sev_snp_enabled {
-                    cpu_manager
-                        .lock()
-                        .unwrap()
-                        .create_boot_vcpus(snapshot_from_id(snapshot, CPU_MANAGER_SNAPSHOT_ID))
-                        .map_err(Error::CpuManager)?;
-                }
-            } else {
-                cpu_manager
-                    .lock()
-                    .unwrap()
-                    .create_boot_vcpus(snapshot_from_id(snapshot, CPU_MANAGER_SNAPSHOT_ID))
-                    .map_err(Error::CpuManager)?;
-            }
-        }
-
-        // For KVM, we need to create interrupt controller after we create boot vcpus.
-        // Because we restore GIC state from the snapshot as part of boot vcpu creation.
-        // This means that we need to create interrupt controller after we restore in case of KVM guests.
-        #[cfg(feature = "kvm")]
-        {
-            if is_kvm {
-                let ic = device_manager
-                    .lock()
-                    .unwrap()
-                    .create_interrupt_controller()
-                    .map_err(Error::DeviceManager)?;
-
-                vm.init().map_err(Error::InitializeVm)?;
-
-                device_manager
-                    .lock()
-                    .unwrap()
-                    .create_devices(console_info, console_resize_pipe, original_termios, ic)
-                    .map_err(Error::DeviceManager)?;
-            }
-        }
-
-        #[cfg(feature = "fw_cfg")]
-        {
-            let fw_cfg_config = config
-                .lock()
-                .unwrap()
-                .payload
-                .as_ref()
-                .is_some_and(|p| p.fw_cfg_config.is_some());
-            if fw_cfg_config {
-                device_manager
-                    .lock()
-                    .unwrap()
-                    .create_fw_cfg_device()
-                    .map_err(Error::DeviceManager)?;
-            }
-        }
-
+        // Load kernel and initramfs files
         #[cfg(feature = "tdx")]
         let kernel = config
             .lock()
@@ -875,7 +658,7 @@ impl Vm {
             None
         };
 
-        let vm_state = if snapshot.is_some() {
+        let state = if snapshot.is_some() {
             VmState::Paused
         } else {
             VmState::Created
@@ -888,7 +671,7 @@ impl Vm {
             device_manager,
             config,
             threads: Vec::with_capacity(1),
-            state: RwLock::new(vm_state),
+            state,
             cpu_manager,
             memory_manager,
             vm,
@@ -899,8 +682,406 @@ impl Vm {
             #[cfg(not(target_arch = "riscv64"))]
             hypervisor,
             stop_on_boot,
-            load_payload_handle: _load_payload_handle,
+            load_payload_handle,
         })
+    }
+
+    /// Determine if IOMMU should be forced based on confidential computing features.
+    fn should_force_iommu(_config: &Arc<Mutex<VmConfig>>) -> bool {
+        #[cfg(feature = "tdx")]
+        if _config.lock().unwrap().is_tdx_enabled() {
+            return true;
+        }
+        #[cfg(feature = "sev_snp")]
+        if _config.lock().unwrap().is_sev_snp_enabled() {
+            return true;
+        }
+        false
+    }
+
+    /// Determine if VM should stop on boot (for debugging).
+    fn should_stop_on_boot(config: &Arc<Mutex<VmConfig>>) -> bool {
+        #[cfg(feature = "guest_debug")]
+        {
+            config.lock().unwrap().gdb
+        }
+        #[cfg(not(feature = "guest_debug"))]
+        {
+            let _ = config;
+            false
+        }
+    }
+
+    /// Create and configure the CPU manager.
+    #[allow(clippy::too_many_arguments)]
+    fn create_cpu_manager(
+        config: &Arc<Mutex<VmConfig>>,
+        vm: Arc<dyn hypervisor::Vm>,
+        exit_evt: EventFd,
+        reset_evt: EventFd,
+        #[cfg(feature = "guest_debug")] vm_debug_evt: EventFd,
+        hypervisor: &Arc<dyn hypervisor::Hypervisor>,
+        seccomp_action: SeccompAction,
+        vm_ops: Arc<dyn VmOps>,
+        numa_nodes: &NumaNodes,
+    ) -> Result<Arc<Mutex<cpu::CpuManager>>> {
+        #[cfg(feature = "tdx")]
+        let tdx_enabled = config.lock().unwrap().is_tdx_enabled();
+        #[cfg(feature = "sev_snp")]
+        let sev_snp_enabled = config.lock().unwrap().is_sev_snp_enabled();
+
+        let cpus_config = config.lock().unwrap().cpus.clone();
+        let cpu_manager = cpu::CpuManager::new(
+            &cpus_config,
+            vm,
+            exit_evt,
+            reset_evt,
+            #[cfg(feature = "guest_debug")]
+            vm_debug_evt,
+            hypervisor.clone(),
+            seccomp_action,
+            vm_ops,
+            #[cfg(feature = "tdx")]
+            tdx_enabled,
+            numa_nodes,
+            #[cfg(feature = "sev_snp")]
+            sev_snp_enabled,
+        )
+        .map_err(Error::CpuManager)?;
+
+        #[cfg(target_arch = "x86_64")]
+        cpu_manager
+            .lock()
+            .unwrap()
+            .populate_cpuid(
+                hypervisor.as_ref(),
+                #[cfg(feature = "tdx")]
+                tdx_enabled,
+            )
+            .map_err(Error::CpuManager)?;
+
+        Ok(cpu_manager)
+    }
+
+    /// Initialize TDX if enabled.
+    #[cfg(feature = "tdx")]
+    fn init_tdx_if_enabled(
+        config: &Arc<Mutex<VmConfig>>,
+        vm: &Arc<dyn hypervisor::Vm>,
+        cpu_manager: &Arc<Mutex<cpu::CpuManager>>,
+    ) -> Result<()> {
+        if config.lock().unwrap().is_tdx_enabled() {
+            let cpuid = cpu_manager.lock().unwrap().common_cpuid();
+            let max_vcpus = cpu_manager.lock().unwrap().max_vcpus();
+            vm.tdx_init(&cpuid, max_vcpus)
+                .map_err(Error::InitializeTdxVm)?;
+        }
+        Ok(())
+    }
+
+    /// Create and configure the device manager.
+    #[allow(clippy::too_many_arguments)]
+    fn create_device_manager(
+        io_bus: Arc<Bus>,
+        mmio_bus: Arc<Bus>,
+        vm: Arc<dyn hypervisor::Vm>,
+        config: Arc<Mutex<VmConfig>>,
+        memory_manager: Arc<Mutex<MemoryManager>>,
+        cpu_manager: Arc<Mutex<cpu::CpuManager>>,
+        exit_evt: EventFd,
+        reset_evt: EventFd,
+        seccomp_action: SeccompAction,
+        numa_nodes: NumaNodes,
+        activate_evt: &EventFd,
+        force_iommu: bool,
+        boot_id_list: BTreeSet<String>,
+        #[cfg(not(target_arch = "riscv64"))] timestamp: Instant,
+        snapshot: Option<&Snapshot>,
+    ) -> Result<Arc<Mutex<DeviceManager>>> {
+        #[cfg(feature = "tdx")]
+        let dynamic = !config.lock().unwrap().is_tdx_enabled();
+        #[cfg(not(feature = "tdx"))]
+        let dynamic = true;
+
+        DeviceManager::new(
+            io_bus,
+            mmio_bus,
+            vm,
+            config,
+            memory_manager,
+            cpu_manager,
+            exit_evt,
+            reset_evt,
+            seccomp_action,
+            numa_nodes,
+            activate_evt,
+            force_iommu,
+            boot_id_list,
+            #[cfg(not(target_arch = "riscv64"))]
+            timestamp,
+            snapshot_from_id(snapshot, DEVICE_MANAGER_SNAPSHOT_ID),
+            dynamic,
+        )
+        .map_err(Error::DeviceManager)
+    }
+
+    /// Perform hypervisor-specific initialization.
+    ///
+    /// This handles the different initialization sequences required by:
+    /// - KVM (x86_64, aarch64, riscv64)
+    /// - MSHV (x86_64, aarch64)
+    /// - SEV-SNP (MSHV with confidential computing)
+    #[allow(clippy::too_many_arguments)]
+    fn hypervisor_specific_init(
+        vm: &Arc<dyn hypervisor::Vm>,
+        memory_manager: &Arc<Mutex<MemoryManager>>,
+        cpu_manager: &Arc<Mutex<cpu::CpuManager>>,
+        device_manager: &Arc<Mutex<DeviceManager>>,
+        config: &Arc<Mutex<VmConfig>>,
+        hypervisor: &Arc<dyn hypervisor::Hypervisor>,
+        console_info: Option<&ConsoleInfo>,
+        console_resize_pipe: Option<&Arc<File>>,
+        original_termios: &Arc<Mutex<Option<termios>>>,
+        snapshot: Option<&Snapshot>,
+    ) -> Result<Option<thread::JoinHandle<Result<EntryPoint>>>> {
+        #[cfg(feature = "mshv")]
+        let is_mshv = matches!(
+            hypervisor.hypervisor_type(),
+            hypervisor::HypervisorType::Mshv
+        );
+        #[cfg(feature = "kvm")]
+        let is_kvm = matches!(
+            hypervisor.hypervisor_type(),
+            hypervisor::HypervisorType::Kvm
+        );
+
+        #[cfg(feature = "sev_snp")]
+        let sev_snp_enabled = config.lock().unwrap().is_sev_snp_enabled();
+
+        // MSHV-specific initialization (non-aarch64)
+        #[cfg(all(feature = "mshv", not(target_arch = "aarch64")))]
+        if is_mshv {
+            vm.init().map_err(Error::InitializeVm)?;
+        }
+
+        // SEV-SNP specific initialization
+        #[cfg(feature = "sev_snp")]
+        if sev_snp_enabled {
+            return Self::init_sev_snp(
+                vm,
+                memory_manager,
+                cpu_manager,
+                device_manager,
+                config,
+                console_info,
+                console_resize_pipe,
+                original_termios,
+                snapshot,
+            );
+        }
+
+        // MSHV initialization (create interrupt controller and devices)
+        #[cfg(feature = "mshv")]
+        if is_mshv {
+            Self::init_mshv(
+                vm,
+                device_manager,
+                console_info,
+                console_resize_pipe,
+                original_termios,
+            )?;
+        }
+
+        // Allocate address space for non-SEV-SNP guests
+        memory_manager
+            .lock()
+            .unwrap()
+            .allocate_address_space()
+            .map_err(Error::MemoryManager)?;
+
+        // Load payload asynchronously
+        let load_payload_handle = if snapshot.is_none() {
+            Self::load_payload_async(
+                memory_manager,
+                config,
+                #[cfg(feature = "igvm")]
+                cpu_manager,
+                #[cfg(feature = "sev_snp")]
+                false,
+            )?
+        } else {
+            None
+        };
+
+        // Create boot vCPUs
+        cpu_manager
+            .lock()
+            .unwrap()
+            .create_boot_vcpus(snapshot_from_id(snapshot, CPU_MANAGER_SNAPSHOT_ID))
+            .map_err(Error::CpuManager)?;
+
+        // KVM-specific initialization
+        #[cfg(feature = "kvm")]
+        if is_kvm {
+            Self::init_kvm(
+                vm,
+                device_manager,
+                console_info.cloned(),
+                console_resize_pipe.cloned(),
+                original_termios.clone(),
+            )?;
+        }
+
+        // Create fw_cfg device if configured
+        #[cfg(feature = "fw_cfg")]
+        Self::create_fw_cfg_if_enabled(config, device_manager)?;
+
+        Ok(load_payload_handle)
+    }
+
+    /// Initialize SEV-SNP specific components.
+    #[cfg(feature = "sev_snp")]
+    #[allow(clippy::too_many_arguments)]
+    fn init_sev_snp(
+        vm: &Arc<dyn hypervisor::Vm>,
+        memory_manager: &Arc<Mutex<MemoryManager>>,
+        cpu_manager: &Arc<Mutex<cpu::CpuManager>>,
+        device_manager: &Arc<Mutex<DeviceManager>>,
+        config: &Arc<Mutex<VmConfig>>,
+        console_info: Option<&ConsoleInfo>,
+        console_resize_pipe: Option<&Arc<File>>,
+        original_termios: &Arc<Mutex<Option<termios>>>,
+        snapshot: Option<&Snapshot>,
+    ) -> Result<Option<thread::JoinHandle<Result<EntryPoint>>>> {
+        // Create boot vCPUs before SEV-SNP initialization
+        cpu_manager
+            .lock()
+            .unwrap()
+            .create_boot_vcpus(snapshot_from_id(snapshot, CPU_MANAGER_SNAPSHOT_ID))
+            .map_err(Error::CpuManager)?;
+
+        // Initialize SEV-SNP - transitions guest into secure state
+        vm.sev_snp_init().map_err(Error::InitializeSevSnpVm)?;
+
+        // Load payload for SEV-SNP (IGVM parser needs cpu_manager for cpuid)
+        let load_payload_handle = if snapshot.is_none() {
+            Self::load_payload_async(
+                memory_manager,
+                config,
+                #[cfg(feature = "igvm")]
+                cpu_manager,
+                true,
+            )?
+        } else {
+            None
+        };
+
+        // Create interrupt controller and devices for MSHV
+        let ic = device_manager
+            .lock()
+            .unwrap()
+            .create_interrupt_controller()
+            .map_err(Error::DeviceManager)?;
+
+        #[cfg(target_arch = "aarch64")]
+        vm.init().map_err(Error::InitializeVm)?;
+
+        device_manager
+            .lock()
+            .unwrap()
+            .create_devices(
+                console_info.cloned(),
+                console_resize_pipe.cloned(),
+                original_termios.clone(),
+                ic,
+            )
+            .map_err(Error::DeviceManager)?;
+
+        Ok(load_payload_handle)
+    }
+
+    /// Initialize MSHV-specific components.
+    #[cfg(feature = "mshv")]
+    fn init_mshv(
+        _vm: &Arc<dyn hypervisor::Vm>,
+        device_manager: &Arc<Mutex<DeviceManager>>,
+        console_info: Option<&ConsoleInfo>,
+        console_resize_pipe: Option<&Arc<File>>,
+        original_termios: &Arc<Mutex<Option<termios>>>,
+    ) -> Result<()> {
+        let ic = device_manager
+            .lock()
+            .unwrap()
+            .create_interrupt_controller()
+            .map_err(Error::DeviceManager)?;
+
+        #[cfg(target_arch = "aarch64")]
+        _vm.init().map_err(Error::InitializeVm)?;
+
+        device_manager
+            .lock()
+            .unwrap()
+            .create_devices(
+                console_info.cloned(),
+                console_resize_pipe.cloned(),
+                original_termios.clone(),
+                ic,
+            )
+            .map_err(Error::DeviceManager)?;
+
+        Ok(())
+    }
+
+    /// Initialize KVM-specific components.
+    #[cfg(feature = "kvm")]
+    fn init_kvm(
+        vm: &Arc<dyn hypervisor::Vm>,
+        device_manager: &Arc<Mutex<DeviceManager>>,
+        console_info: Option<ConsoleInfo>,
+        console_resize_pipe: Option<Arc<File>>,
+        original_termios: Arc<Mutex<Option<termios>>>,
+    ) -> Result<()> {
+        // For KVM, create interrupt controller after boot vcpus
+        // because GIC state is restored from snapshot during vcpu creation
+        let ic = device_manager
+            .lock()
+            .unwrap()
+            .create_interrupt_controller()
+            .map_err(Error::DeviceManager)?;
+
+        vm.init().map_err(Error::InitializeVm)?;
+
+        device_manager
+            .lock()
+            .unwrap()
+            .create_devices(console_info, console_resize_pipe, original_termios, ic)
+            .map_err(Error::DeviceManager)?;
+
+        Ok(())
+    }
+
+    /// Create fw_cfg device if enabled in configuration.
+    #[cfg(feature = "fw_cfg")]
+    fn create_fw_cfg_if_enabled(
+        config: &Arc<Mutex<VmConfig>>,
+        device_manager: &Arc<Mutex<DeviceManager>>,
+    ) -> Result<()> {
+        let fw_cfg_enabled = config
+            .lock()
+            .unwrap()
+            .payload
+            .as_ref()
+            .is_some_and(|p| p.fw_cfg_config.is_some());
+
+        if fw_cfg_enabled {
+            device_manager
+                .lock()
+                .unwrap()
+                .create_fw_cfg_device()
+                .map_err(Error::DeviceManager)?;
+        }
+
+        Ok(())
     }
 
     #[cfg(feature = "fw_cfg")]
@@ -1032,6 +1213,12 @@ impl Vm {
                         let dest = distance.destination;
                         let dist = distance.distance;
 
+                        if dest == config.guest_numa_id && dist != 10 {
+                            warn!(
+                                "Ignoring self-distance {dest}@{dist} (must be 10 per ACPI spec)"
+                            );
+                        }
+
                         if !configs.iter().any(|cfg| cfg.guest_numa_id == dest) {
                             error!("Unknown destination NUMA node {dest}");
                             return Err(Error::InvalidNumaConfig);
@@ -1045,6 +1232,8 @@ impl Vm {
                         node.distances.insert(dest, dist);
                     }
                 }
+
+                node.device_id = config.device_id.clone();
 
                 numa_nodes.insert(config.guest_numa_id, node);
             }
@@ -1068,6 +1257,7 @@ impl Vm {
         snapshot: Option<&Snapshot>,
         source_url: Option<&str>,
         prefault: Option<bool>,
+        memory_restore_mode: Option<MemoryRestoreMode>,
     ) -> Result<Self> {
         trace_scoped!("Vm::new");
 
@@ -1103,8 +1293,10 @@ impl Vm {
                     vm.clone(),
                     &vm_config.lock().unwrap().memory.clone(),
                     source_url,
-                    prefault.unwrap(),
+                    prefault.unwrap_or(false),
+                    memory_restore_mode.unwrap_or_default(),
                     phys_bits,
+                    &exit_evt,
                 )
                 .map_err(Error::MemoryManager)?
             } else {
@@ -1205,7 +1397,11 @@ impl Vm {
         mut firmware: &File,
         memory_manager: Arc<Mutex<MemoryManager>>,
     ) -> Result<EntryPoint> {
-        let uefi_flash = memory_manager.lock().as_ref().unwrap().uefi_flash();
+        let mut memory_manager = memory_manager.lock().unwrap();
+        memory_manager
+            .add_uefi_flash()
+            .map_err(Error::MemoryManager)?;
+        let uefi_flash = memory_manager.uefi_flash();
         let mem = uefi_flash.memory();
         arch::uefi::load_uefi(mem.deref(), arch::layout::UEFI_START, &mut firmware)
             .map_err(Error::UefiLoad)?;
@@ -1663,10 +1859,9 @@ impl Vm {
     }
 
     pub fn shutdown(&mut self) -> Result<()> {
-        let mut state = self.state.try_write().map_err(|_| Error::PoisonedState)?;
         let new_state = VmState::Shutdown;
 
-        state.valid_transition(new_state)?;
+        self.state.valid_transition(new_state)?;
 
         // Wake up the DeviceManager threads so they will get terminated cleanly
         self.device_manager
@@ -1685,7 +1880,7 @@ impl Vm {
         for thread in self.threads.drain(..) {
             thread.join().map_err(Error::ThreadCleanup)?;
         }
-        *state = new_state;
+        self.state = new_state;
 
         Ok(())
     }
@@ -1927,6 +2122,33 @@ impl Vm {
         {
             let mut config = self.config.lock().unwrap();
             add_to_config(&mut config.fs, fs_cfg);
+        }
+
+        self.device_manager
+            .lock()
+            .unwrap()
+            .notify_hotplug(AcpiNotificationFlags::PCI_DEVICES_CHANGED)
+            .map_err(Error::DeviceManager)?;
+
+        Ok(pci_device_info)
+    }
+
+    pub fn add_generic_vhost_user(
+        &mut self,
+        mut generic_vhost_user_cfg: GenericVhostUserConfig,
+    ) -> Result<PciDeviceInfo> {
+        let pci_device_info = self
+            .device_manager
+            .lock()
+            .unwrap()
+            .add_generic_vhost_user(&mut generic_vhost_user_cfg)
+            .map_err(Error::DeviceManager)?;
+
+        // Update VmConfig by adding the new device. This is important to
+        // ensure the device would be created in case of a reboot.
+        {
+            let mut config = self.config.lock().unwrap();
+            add_to_config(&mut config.generic_vhost_user, generic_vhost_user_cfg);
         }
 
         self.device_manager
@@ -2288,9 +2510,9 @@ impl Vm {
         // Loop over the ACPI tables and copy them to the HOB.
 
         for acpi_table in crate::acpi::create_acpi_tables_tdx(
-            &self.device_manager,
-            &self.cpu_manager,
-            &self.memory_manager,
+            &self.device_manager.lock().unwrap(),
+            &self.cpu_manager.lock().unwrap(),
+            &self.memory_manager.lock().unwrap(),
             &self.numa_nodes,
         ) {
             hob.add_acpi_table(&mem, acpi_table.as_slice())
@@ -2350,9 +2572,9 @@ impl Vm {
         let tpm_enabled = self.config.lock().unwrap().tpm.is_some();
         let rsdp_addr = crate::acpi::create_acpi_tables(
             &mem,
-            &self.device_manager,
-            &self.cpu_manager,
-            &self.memory_manager,
+            &self.device_manager.lock().unwrap(),
+            &self.cpu_manager.lock().unwrap(),
+            &self.memory_manager.lock().unwrap(),
             &self.numa_nodes,
             tpm_enabled,
         );
@@ -2372,7 +2594,7 @@ impl Vm {
 
     pub fn boot(&mut self) -> Result<()> {
         trace_scoped!("Vm::boot");
-        let current_state = self.get_state()?;
+        let current_state = self.state;
         if current_state == VmState::Paused {
             return self.resume().map_err(Error::Resume);
         }
@@ -2417,9 +2639,9 @@ impl Vm {
                 if fw_cfg_config.acpi_tables {
                     let tpm_enabled = self.config.lock().unwrap().tpm.is_some();
                     crate::acpi::create_acpi_tables_for_fw_cfg(
-                        &self.device_manager,
-                        &self.cpu_manager,
-                        &self.memory_manager,
+                        &self.device_manager.lock().unwrap(),
+                        &self.cpu_manager.lock().unwrap(),
+                        &self.memory_manager.lock().unwrap(),
                         &self.numa_nodes,
                         tpm_enabled,
                     )?;
@@ -2556,8 +2778,7 @@ impl Vm {
             .start_boot_vcpus(new_state == VmState::BreakPoint)
             .map_err(Error::CpuManager)?;
 
-        let mut state = self.state.try_write().map_err(|_| Error::PoisonedState)?;
-        *state = new_state;
+        self.state = new_state;
         Ok(())
     }
 
@@ -2587,17 +2808,22 @@ impl Vm {
         Arc::clone(&self.config)
     }
 
-    /// Get the VM state. Returns an error if the state is poisoned.
-    pub fn get_state(&self) -> Result<VmState> {
+    /// Get the VM state.
+    pub fn get_state(&self) -> VmState {
         self.state
-            .try_read()
-            .map_err(|_| Error::PoisonedState)
-            .map(|state| *state)
     }
 
     /// Gets the actual size of the balloon.
     pub fn balloon_size(&self) -> u64 {
         self.device_manager.lock().unwrap().balloon_size()
+    }
+
+    /// Get the actual size of the virtio_mem regions
+    pub fn virtio_mem_plugged_size(&self) -> u64 {
+        self.memory_manager
+            .lock()
+            .unwrap()
+            .virtio_mem_plugged_size()
     }
 
     pub fn send_memory_fds(
@@ -2631,52 +2857,15 @@ impl Vm {
         Ok(())
     }
 
-    pub fn send_memory_regions<F>(
-        &mut self,
-        ranges: &MemoryRangeTable,
-        fd: &mut F,
-    ) -> std::result::Result<(), MigratableError>
-    where
-        F: WriteVolatile,
-    {
-        let guest_memory = self.memory_manager.lock().as_ref().unwrap().guest_memory();
-        let mem = guest_memory.memory();
-
-        for range in ranges.regions() {
-            let mut offset: u64 = 0;
-            // Here we are manually handling the retry in case we can't the
-            // whole region at once because we can't use the implementation
-            // from vm-memory::GuestMemory of write_all_to() as it is not
-            // following the correct behavior. For more info about this issue
-            // see: https://github.com/rust-vmm/vm-memory/issues/174
-            loop {
-                let bytes_written = mem
-                    .write_volatile_to(
-                        GuestAddress(range.gpa + offset),
-                        fd,
-                        (range.length - offset) as usize,
-                    )
-                    .map_err(|e| {
-                        MigratableError::MigrateSend(anyhow!(
-                            "Error transferring memory to socket: {e}"
-                        ))
-                    })?;
-                offset += bytes_written as u64;
-
-                if offset == range.length {
-                    break;
-                }
-            }
-        }
-
-        Ok(())
-    }
-
     pub fn memory_range_table(&self) -> std::result::Result<MemoryRangeTable, MigratableError> {
         self.memory_manager
             .lock()
             .unwrap()
             .memory_range_table(false)
+    }
+
+    pub fn guest_memory(&self) -> GuestMemoryAtomic<GuestMemoryMmap> {
+        self.memory_manager.lock().unwrap().guest_memory()
     }
 
     pub fn device_tree(&self) -> Arc<Mutex<DeviceTree>> {
@@ -2844,13 +3033,8 @@ impl Vm {
 impl Pausable for Vm {
     fn pause(&mut self) -> std::result::Result<(), MigratableError> {
         event!("vm", "pausing");
-        let mut state = self
-            .state
-            .try_write()
-            .map_err(|e| MigratableError::Pause(anyhow!("Could not get VM state: {e}")))?;
         let new_state = VmState::Paused;
-
-        state
+        self.state
             .valid_transition(new_state)
             .map_err(|e| MigratableError::Pause(anyhow!("Invalid transition: {e:?}")))?;
 
@@ -2877,7 +3061,7 @@ impl Pausable for Vm {
             .pause()
             .map_err(|e| MigratableError::Pause(anyhow!("Could not pause the VM: {e}")))?;
 
-        *state = new_state;
+        self.state = new_state;
 
         event!("vm", "paused");
         Ok(())
@@ -2885,18 +3069,15 @@ impl Pausable for Vm {
 
     fn resume(&mut self) -> std::result::Result<(), MigratableError> {
         event!("vm", "resuming");
-        let current_state = self.get_state().unwrap();
-        let mut state = self
-            .state
-            .try_write()
-            .map_err(|e| MigratableError::Resume(anyhow!("Could not get VM state: {e}")))?;
+        let current_state = self.get_state();
         let new_state = VmState::Running;
 
-        state
+        self.state
             .valid_transition(new_state)
             .map_err(|e| MigratableError::Resume(anyhow!("Invalid transition: {e:?}")))?;
 
-        self.cpu_manager.lock().unwrap().resume()?;
+        // Restore KVM clock BEFORE vCPUs start running, so they see correct
+        // TSC/kvmclock from the first instruction after resume.
         #[cfg(target_arch = "x86_64")]
         {
             if let Some(clock) = &self.saved_clock {
@@ -2913,9 +3094,10 @@ impl Pausable for Vm {
         }
 
         self.device_manager.lock().unwrap().resume()?;
+        self.cpu_manager.lock().unwrap().resume()?;
 
         // And we're back to the Running state.
-        *state = new_state;
+        self.state = new_state;
         event!("vm", "resumed");
         Ok(())
     }
@@ -2947,8 +3129,7 @@ impl Snapshottable for Vm {
             }
         }
 
-        let current_state = self.get_state().unwrap();
-        if current_state != VmState::Paused {
+        if self.get_state() != VmState::Paused {
             return Err(MigratableError::Snapshot(anyhow!(
                 "Trying to snapshot while VM is running"
             )));
@@ -3110,20 +3291,16 @@ impl Debuggable for Vm {
     }
 
     fn debug_pause(&mut self) -> std::result::Result<(), DebuggableError> {
-        if *self.state.read().unwrap() == VmState::Running {
+        if self.state == VmState::Running {
             self.pause().map_err(DebuggableError::Pause)?;
         }
 
-        let mut state = self
-            .state
-            .try_write()
-            .map_err(|_| DebuggableError::PoisonedState)?;
-        *state = VmState::BreakPoint;
+        self.state = VmState::BreakPoint;
         Ok(())
     }
 
     fn debug_resume(&mut self) -> std::result::Result<(), DebuggableError> {
-        if *self.state.read().unwrap() == VmState::BreakPoint {
+        if self.state == VmState::BreakPoint {
             self.resume().map_err(DebuggableError::Pause)?;
         }
 
@@ -3203,7 +3380,7 @@ impl GuestDebuggable for Vm {
             }
         }
 
-        match self.get_state().unwrap() {
+        match self.get_state() {
             VmState::Running => {
                 self.pause().map_err(GuestDebuggableError::Pause)?;
                 resume = true;

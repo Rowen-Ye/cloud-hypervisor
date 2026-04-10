@@ -137,6 +137,7 @@ impl RequestHandler for StubApiRequestHandler {
                     affinity: None,
                     features: CpuFeatures::default(),
                     nested: true,
+                    core_scheduling: CoreScheduling::default(),
                 },
                 memory: MemoryConfig {
                     size: 536_870_912,
@@ -168,6 +169,7 @@ impl RequestHandler for StubApiRequestHandler {
                 },
                 balloon: None,
                 fs: None,
+                generic_vhost_user: None,
                 pmem: None,
                 serial: ConsoleConfig {
                     file: None,
@@ -251,6 +253,13 @@ impl RequestHandler for StubApiRequestHandler {
     }
 
     fn vm_add_fs(&mut self, _: FsConfig) -> Result<Option<Vec<u8>>, VmError> {
+        Ok(None)
+    }
+
+    fn vm_add_generic_vhost_user(
+        &mut self,
+        _: GenericVhostUserConfig,
+    ) -> Result<Option<Vec<u8>>, VmError> {
         Ok(None)
     }
 

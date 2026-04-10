@@ -21,7 +21,7 @@ convention and enforce it through the Continuous Integration (CI) process callin
 
 ```sh
 # We currently rely on nightly-only formatting features
-cargo +nightly fmt --all 
+cargo +nightly fmt --all
 cargo check --all-targets --tests
 cargo clippy --all-targets --tests
 # Please note that this will not execute integration tests.
@@ -36,7 +36,7 @@ gitlint --commits "HEAD~3..HEAD"
 _Caution: These tests are taking a long time to complete (40+ mins) and need special setup._
 
 ```sh
- bash ./scripts/dev_cli.sh tests --integration -- --test-filter '<optionally filter test by name pattern>' 
+ bash ./scripts/dev_cli.sh tests --integration -- --test-filter '<optionally filter test by name pattern>'
 ```
 
 ### Setup Commit Hook
@@ -58,41 +58,64 @@ commit you make.
 
 ## Certificate of Origin
 
-In order to get a clear contribution chain of trust we use the [signed-off-by language](https://web.archive.org/web/20230406041855/https://01.org/community/signed-process)
+In order to get a clear contribution chain of trust we use the [signed-off-by language](https://www.kernel.org/doc/Documentation/process/submitting-patches.rst)
 used by the Linux kernel project.
 
-## Patch format
+## Patch format & Git Commit Hygiene
 
-Beside the signed-off-by footer, we expect each patch to comply with the following format:
+_We use **Patch** as synonym for **Commit**._
 
-```
-<component>: Change summary
+We require patches to:
 
-More detailed explanation of your changes: Why and how.
-Wrap it to 72 characters.
-See http://chris.beams.io/posts/git-commit/
-for some more good pieces of advice.
+- Have a `Signed-off-by: Name <email>` footer
+- Follow the pattern: \
+  ```
+   <component>: Change summary
 
-Signed-off-by: <contributor@foo.com>
-```
+   More detailed explanation of your changes: Why and how.
+   Wrap it to 72 characters.
+   See http://chris.beams.io/posts/git-commit/
+   for some more good pieces of advice.
 
-For example:
+   Signed-off-by: <contributor@foo.com>
+   ```
+
+
+Valid components are listed in `TitleStartsWithComponent.py`. In short, each
+cargo workspace member is a valid component as well as `build`, `ci`, `docs` and
+`misc`.
+
+Example patch:
 
 ```
 vm-virtio: Reset underlying device on driver request
-    
+
 If the driver triggers a reset by writing zero into the status register
 then reset the underlying device if supported. A device reset also
 requires resetting various aspects of the queue.
-    
+
 In order to be able to do a subsequent reactivate it is required to
 reclaim certain resources (interrupt and queue EventFDs.) If a device
 reset is requested by the driver but the underlying device does not
 support it then generate an error as the driver would not be able to
 configure it anyway.
-    
+
 Signed-off-by: Rob Bradford <robert.bradford@intel.com>
 ```
+
+### Git Commit History
+
+We value a clean, **reviewable** commit history. Each commit should represent
+a self-contained, logical step that guides reviewers clearly from A to B.
+
+Avoid patterns like `init A -> init B -> fix A` or \
+`init design A -> revert A -> use design B`. Commits must be independently
+reviewable - don't leave "fix previous commit" or earlier design attempts in
+the history.
+
+Intermediate work-in-progress changes are acceptable only if a subsequent
+commit in the same series cleans them up (e.g. a temporary `#[allow(unused)]`
+removed in the next commit).
 
 ## Pull requests
 
@@ -104,9 +127,13 @@ you want to merge your changes to `cloud-hypervisor`:
 1. Within your fork, create a branch for your contribution.
 1. [Create a pull request](https://help.github.com/articles/creating-a-pull-request-from-a-fork/)
    against the main branch of the Cloud Hypervisor repository.
-1. To update your pull request amend existing commits whenever applicable and
-   then push the new changes to your pull request branch.
+1. Each commit must comply with the Commit Hygiene guidelines above.
+1. A pull request should address a single component or concern to keep review
+   focused and approvals straightforward.
 1. Once the pull request is approved it can be integrated.
+
+Please squash any changes done during review already into the corresponding
+commits instead of pushing `<component>: addressing review for A`-style commits.
 
 ## Issue tracking
 
@@ -123,26 +150,63 @@ comments or by adding the `Fixes` keyword to your commit message:
 
 ```
 serial: Set terminal in raw mode
-    
+
 In order to have proper output from the serial, we need to setup the
 terminal in raw mode. When the VM is shutting down, it is also the
 VMM responsibility to set the terminal back into canonical mode if we
 don't want to get any weird behavior from the shell.
-    
+
 Fixes #88
-	
+
 Signed-off-by: Sebastien Boeuf <sebastien.boeuf@intel.com>
 ```
 
 Then, after the corresponding PR is merged, GitHub will automatically close that issue when parsing the
 [commit message](https://help.github.com/articles/closing-issues-via-commit-messages/).
 
-## AI Generated Code
+## AI/LLM Assistance & Generated Code
 
-Our policy is to decline any contributions known to contain contents
-generated or derived from using Large Language Models (LLMs). This
-includes ChatGPT, Gemini, Claude, Copilot and similar tools.
+We recommend **a careful and conservative approach** to LLM usage, guided by
+sound engineering judgment. Please use AI/LLM-assisted tooling thoughtfully and
+responsibly to ensure efficient use of limited project resources, particularly
+in code review and long-term maintenance. Our primary goals are to avoid
+ambiguity in license compliance and to keep contributions clear and easy to
+review.
 
-The goal is to avoid ambiguity in license compliance and optimize the
-use of limited project resources, especially for code review and
-maintenance. This policy can be revisited as LLMs evolve and mature.
+Or in other words: please apply common sense and don't blindly accept LLM
+suggestions.
+
+This policy can be revisited as LLMs evolve and mature.
+
+### Code Review
+
+We generally recommend doing early coarse-grained reviews using state-of-the-art
+LLMs. This can help identify rough edges, copy & paste errors, and typos early
+on. This reduces review cycles for human reviewers.
+
+Please **do not** use GitHub Copilot directly in PRs to keep discussions clean.
+Instead, ask an LLM of your choice for a review. A convenient way to do this is
+
+- appending `.patch` to the GitHub PR URL
+  (e.g., `https://github.com/cloud-hypervisor/cloud-hypervisor/pull/1234.patch`)
+  and pasting it into the LLM of your choice, or
+- using a local agent in your terminal, such as `codex` or `claude`.
+
+### Contributions assisted by LLMs
+
+All contributions **must** be submitted by a human contributor. Automated or
+bot-driven PRs are not accepted.
+
+You are responsible for every piece of code you submit, and you must understand
+both the design and the implementation details. LLMs are useful for prototyping
+and generating boilerplate code. However, large or complex logic must be
+authored and fully understood by the contributor - LLM output should not be
+submitted without careful review and comprehension.
+
+Please disclose LLM use in your commit message and PR description if it
+meaningfully contributed to the submitted code. Again, we recommend careful and
+conservative use of LLMs, guided by common sense.
+
+Maintainers reserve the right to request additional clarification or decline
+contributions where LLM usage raises concerns. Ultimately, acceptance of any
+contribution is at the maintainers' discretion.

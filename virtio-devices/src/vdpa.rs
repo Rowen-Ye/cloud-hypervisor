@@ -28,7 +28,7 @@ use vmm_sys_util::eventfd::EventFd;
 
 use crate::{
     ActivateError, ActivateResult, DEVICE_ACKNOWLEDGE, DEVICE_DRIVER, DEVICE_DRIVER_OK,
-    DEVICE_FEATURES_OK, GuestMemoryMmap, VIRTIO_F_IOMMU_PLATFORM, VirtioCommon, VirtioDevice,
+    DEVICE_FEATURES_OK, GuestMemoryMmap, VIRTIO_F_ACCESS_PLATFORM, VirtioCommon, VirtioDevice,
     VirtioInterrupt, VirtioInterruptType, get_host_address_range,
 };
 
@@ -164,7 +164,7 @@ impl Vdpa {
 
             let iova_range = vhost.get_iova_range().map_err(Error::GetIovaRange)?;
 
-            if avail_features & (1u64 << VIRTIO_F_IOMMU_PLATFORM) == 0 {
+            if avail_features & (1u64 << VIRTIO_F_ACCESS_PLATFORM) == 0 {
                 return Err(Error::MissingAccessPlatformVirtioFeature);
             }
 
@@ -217,7 +217,7 @@ impl Vdpa {
 
     fn activate_vdpa(
         &mut self,
-        mem: &GuestMemoryMmap,
+        _mem: &GuestMemoryMmap,
         virtio_interrupt: &dyn VirtioInterrupt,
         queues: &[(usize, Queue, EventFd)],
     ) -> Result<()> {
@@ -269,13 +269,7 @@ impl Vdpa {
             self.vhost
                 .as_ref()
                 .unwrap()
-                .set_vring_base(
-                    *queue_index,
-                    queue
-                        .avail_idx(mem, Ordering::Acquire)
-                        .map_err(Error::GetAvailableIndex)?
-                        .0,
-                )
+                .set_vring_base(*queue_index, 0)
                 .map_err(Error::SetVringBase)?;
 
             if let Some(eventfd) =
@@ -428,12 +422,13 @@ impl VirtioDevice for Vdpa {
         }
     }
 
-    fn activate(
-        &mut self,
-        mem: GuestMemoryAtomic<GuestMemoryMmap>,
-        virtio_interrupt: Arc<dyn VirtioInterrupt>,
-        queues: Vec<(usize, Queue, EventFd)>,
-    ) -> ActivateResult {
+    fn activate(&mut self, context: crate::device::ActivationContext) -> ActivateResult {
+        let crate::device::ActivationContext {
+            mem,
+            interrupt_cb: virtio_interrupt,
+            queues,
+            ..
+        } = context;
         self.activate_vdpa(&mem.memory(), virtio_interrupt.as_ref(), &queues)
             .map_err(ActivateError::ActivateVdpa)?;
 
